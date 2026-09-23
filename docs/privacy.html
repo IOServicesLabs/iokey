@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy Policy — IOKey</title>
+<meta name="description" content="IOKey collects nothing. Nothing you type is sent anywhere.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+
+<a class="backlink" href="index.html">&larr; IOKey</a>
+
+<h1>Privacy Policy</h1>
+<p class="meta">
+  <strong>Effective date:</strong> 31 July 2026 &middot;
+  <strong>Applies to:</strong> IOKey for Android (<code>com.localboard.keyboard</code>) &middot;
+  <strong>Contact:</strong> <a href="mailto:support@ioservices.io">support@ioservices.io</a>
+</p>
+
+<div class="lede">
+  <p><strong>IOKey does not collect anything. Nothing you type is sent anywhere.</strong></p>
+  <p>There is no account, no sign-in, no analytics, no advertising, no crash reporting
+  service, and no server that belongs to us — we do not operate a backend at all.
+  Everything the keyboard learns about you stays in encrypted storage on your own phone
+  and is deleted when you uninstall the app.</p>
+  <p>A keyboard sees every password, message and search you type. That is why this app is
+  built so that the data physically cannot leave: not as a promise, but because there is
+  nowhere for it to go.</p>
+</div>
+
+<h2>1. What we collect</h2>
+<p><strong>Nothing.</strong> We operate no servers and receive no data from the app — not
+usage statistics, not diagnostics, not your device identifier, not a count of installs
+beyond what Google Play reports to every developer.</p>
+<p>We cannot identify you, and we could not hand over your typing data if we were asked for
+it, because we have never had it.</p>
+
+<h2>2. What the app stores on your device</h2>
+<p>All of this lives only on your phone, in the app's private storage. Other apps cannot
+read it.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>What</th><th>Why</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td>Words and phrases you type</td><td>Autocorrect, predictions and glide typing get better the more they match how <em>you</em> write</td><td>Encrypted database</td></tr>
+<tr><td>A learned personal dictionary</td><td>So names and slang you use stop being autocorrected away</td><td>Encrypted database</td></tr>
+<tr><td>Your settings, theme and layout</td><td>To remember how you set the keyboard up</td><td>App preferences</td></tr>
+<tr><td>Optional: contact first names</td><td>Only if you turn on “learn contact names”, so people's names stop being corrected. Only names are read — never numbers, emails or any other field</td><td>Encrypted database, as isolated words</td></tr>
+<tr><td>Optional: a downloaded AI model</td><td>If you choose to download one</td><td>App file storage</td></tr>
+<tr><td>The last few crash reports</td><td>Shown to you in Settings so a bug can be described accurately. Never uploaded</td><td>Plain text file, capped in size</td></tr>
+</tbody>
+</table>
+</div>
+
+<p><strong>Encryption.</strong> The typing database is encrypted with SQLCipher (AES-256).
+The key is generated on your device, stored in the Android Keystore — hardware-backed on
+phones that have a secure element — and never leaves it. It is not derived from anything we
+know, and we have no copy.</p>
+
+<h3>Deleting it</h3>
+<ul>
+<li><strong>Settings → Data controls</strong> lets you erase the learned dictionary and
+typing history at any time, and inspect exactly what has been learned before you do.</li>
+<li><strong>Uninstalling the app</strong> destroys all of it, including the encryption key.</li>
+</ul>
+<p>There is no server-side copy to request the deletion of, because there is no server.</p>
+
+<h2>3. When the app uses the network</h2>
+<p>The app declares the <code>INTERNET</code> permission and uses it for exactly two things,
+both of which you start deliberately:</p>
+<ol>
+<li><strong>Downloading an optional AI language model</strong> that you pick in
+<em>Settings → Language model</em>. The download goes to Hugging Face
+(<code>huggingface.co</code>). The request contains no personal data — it is an anonymous
+file download, like any other. Once the file is on your phone the model runs entirely
+offline.</li>
+<li><strong>Downloading an optional offline voice-typing model</strong>, from the same place
+and on the same terms.</li>
+</ol>
+<p>Nothing else ever goes out. Specifically: your keystrokes, your dictionary, your
+messages, your clipboard and your settings are never transmitted, not even in aggregated or
+anonymised form.</p>
+<p>Two controls let you verify this rather than trust it:</p>
+<ul>
+<li><strong>The network kill switch</strong> (<em>Settings → Data controls</em>) blocks the
+app from opening any connection at all. The keyboard is fully functional with it on.</li>
+<li><strong>The egress ledger</strong> records every network request the app makes, with
+what it was for, so you can audit the claim above for yourself.</li>
+</ul>
+
+<h2>4. Permissions, and why each one exists</h2>
+<div class="tablewrap">
+<table>
+<thead><tr><th>Permission</th><th>What it is for</th><th>Optional?</th></tr></thead>
+<tbody>
+<tr><td><code>INTERNET</code></td><td>The two model downloads above</td><td>Can be disabled entirely by the kill switch</td></tr>
+<tr><td><code>VIBRATE</code></td><td>Vibration when you press a key</td><td>Turn haptics off and it is unused</td></tr>
+<tr><td><code>READ_USER_DICTIONARY</code></td><td>One-tap import of words you already added to Android's personal dictionary</td><td>Yes — only on your tap</td></tr>
+<tr><td><code>RECORD_AUDIO</code></td><td>Offline voice typing. Audio is transcribed <strong>on your device</strong> by a local model and is never recorded, stored or uploaded</td><td>Yes — requested only when you tap the microphone</td></tr>
+<tr><td><code>READ_CONTACTS</code></td><td>Only if you enable “learn contact names”. Reads names only; no numbers, no emails, no other field</td><td>Yes — off by default</td></tr>
+<tr><td>Billing</td><td>To sell the one-time Pro unlock through Google Play</td><td>Only in the Play Store version</td></tr>
+</tbody>
+</table>
+</div>
+<p>Some permissions are added automatically by Google's own libraries (for example a wake
+lock and boot-completed receiver used by the scheduler that improves your predictions
+overnight while the phone is charging). They are not used to send anything.</p>
+<p><strong>IOKey never asks for location, camera, photos, files, call logs, or device
+identifiers, because it has no use for them.</strong></p>
+
+<h2>5. Incognito and per-app rules</h2>
+<p>When an app asks Android for a private text field — a password box, or a browser in
+private-browsing mode — IOKey honours it and learns nothing from what you type there.</p>
+<p>You can also set your own rules per app in <em>Settings → Data controls</em>: pick any app
+and tell the keyboard never to learn from it.</p>
+
+<h2>6. Payments</h2>
+<p>The Pro unlock is a <strong>one-time purchase</strong>, not a subscription.</p>
+<p>The transaction is handled entirely by <strong>Google Play Billing</strong>. We never see
+or receive your card number, billing address, or any other payment detail — Google tells the
+app only whether a purchase for this account exists.</p>
+<p>Once bought, the unlock is remembered locally on the device. The app does <strong>not</strong>
+phone home to re-check it, which means Pro keeps working in aeroplane mode and keeps working
+if we ever disappear.</p>
+<p>Google's handling of the payment is covered by
+<a href="https://policies.google.com/privacy">Google's Privacy Policy</a>.</p>
+
+<h2>7. Children</h2>
+<p>IOKey is not directed at children under 13 and does not knowingly collect
+information from them. Since the app collects no information from anyone, there is nothing
+for us to hold or delete.</p>
+
+<h2>8. Your rights (GDPR, CCPA and similar)</h2>
+<p>Laws like the GDPR and CCPA give you the right to access, correct, export and delete the
+personal data a company holds about you, and to know who it has been sold or shared with.</p>
+<p><strong>We hold no personal data about you, and we sell and share none</strong>, so there is
+nothing to request from us. The equivalent controls are in the app itself and work instantly
+and offline:</p>
+<ul>
+<li><strong>Access</strong> — <em>Settings → My writing style</em> shows everything the
+keyboard has learned.</li>
+<li><strong>Export</strong> — <em>Settings → Data controls</em> exports it to an encrypted
+file you control.</li>
+<li><strong>Deletion</strong> — the same screen erases it, or uninstall the app.</li>
+</ul>
+<p>If you are in the EEA or UK, the legal basis for the on-device processing described above
+is your consent, given by installing and enabling the keyboard and by turning on each
+optional feature individually. Withdrawing it is done by turning the feature off.</p>
+
+<h2>9. The direct-download version</h2>
+<div class="note">
+<p><strong>This section does not apply to the Google Play version of IOKey.</strong>
+The two capabilities below are <em>absent</em> from the Play build — the permission is not
+requested and the code is not included in the app at all.</p>
+</div>
+<p>A separate build of IOKey is distributed directly (outside the Play Store) with two
+extra, opt-in capabilities:</p>
+<ul>
+<li><strong>Writing-style import from SMS.</strong> If you explicitly choose it during setup,
+the app makes one pass over messages <em>you have sent</em> to learn your writing style. It
+reads them on the device, records only style statistics, and never transmits or stores the
+message text.</li>
+<li><strong>On-screen context for AI drafting.</strong> An Android accessibility service
+that, once <em>you</em> switch it on in your system Accessibility settings, lets the AI see
+the conversation on screen so a reply it drafts makes sense. The text is held in memory only,
+never written to disk, and never transmitted. It is off until you enable it and stops the
+moment you turn it off.</li>
+</ul>
+<p>Both are optional, both are off by default, and neither sends anything anywhere.</p>
+
+<h2>10. Changes to this policy</h2>
+<p>If this policy changes in a way that affects what the app does with your data, the
+effective date above changes and the updated policy is published here before the change
+ships. Because the app collects nothing, we do not expect this section to see much use.</p>
+
+<h2>11. Contact</h2>
+<p>Questions about this policy, or about anything the app does:
+<a href="mailto:support@ioservices.io">support@ioservices.io</a></p>
+
+<footer>
+  IOKey &middot; <a href="privacy.html">Privacy Policy</a> &middot;
+  <a href="terms.html">Terms of Use</a>
+</footer>
+
+</main>
+</body>
+</html>

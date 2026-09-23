@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- DayNight, not Light: the app chrome colours have values-night
+         counterparts, so Settings follows the system instead of being a
+         full-brightness white sheet at 2am. -->
+    <style name="Theme.LocalBoard" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/app_primary</item>
+        <item name="colorOnPrimary">@color/app_on_primary</item>
+        <item name="colorSurface">@color/app_surface</item>
+        <item name="colorOnSurface">@color/app_text</item>
+        <item name="android:colorBackground">@color/app_bg</item>
+        <item name="android:statusBarColor">@color/app_bg</item>
+        <item name="android:windowBackground">@color/app_bg</item>
+    </style>
+
+    <style name="SettingsSection">
+        <!-- match_parent so the whole heading row is the tap target for
+             expand/collapse, not just the width of the label text. -->
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginBottom">6dp</item>
+        <item name="android:textColor">@color/app_primary</item>
+        <item name="android:textSize">14sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:letterSpacing">0.02</item>
+        <item name="android:drawablePadding">10dp</item>
+    </style>
+
+    <!-- One-line "what this section is currently set to", shown under a
+         collapsed heading so the page reads as a summary at a glance. -->
+    <style name="SettingsSummary">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:textColor">@color/app_text</item>
+        <item name="android:textSize">12.5sp</item>
+        <item name="android:alpha">0.55</item>
+    </style>
+
+    <style name="SettingsHint">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginTop">4dp</item>
+        <item name="android:textColor">@color/app_text</item>
+        <item name="android:textSize">11.5sp</item>
+        <item name="android:alpha">0.55</item>
+    </style>
+
+    <style name="SettingsLabel">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginTop">10dp</item>
+        <item name="android:layout_marginBottom">2dp</item>
+        <item name="android:textColor">@color/app_text</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:alpha">0.75</item>
+    </style>
+</resources>

@@ -1,0 +1,24 @@
+# Normalise text in the repo, so a Windows checkout and a Linux CI runner
+# agree on what the file contains.
+* text=auto eol=lf
+
+# The wrapper script is executed by /bin/sh on the runners. CRLF here is not
+# cosmetic: it makes the shebang unparseable and every CI build dies with
+# "bad interpreter".
+gradlew text eol=lf
+*.sh    text eol=lf
+
+# Windows-only entry point.
+gradlew.bat text eol=crlf
+
+# Binary — never touch these.
+*.jar    binary
+*.so     binary
+*.gguf   binary
+*.ttf    binary
+*.otf    binary
+*.keystore binary
+*.jks    binary
+*.png    binary
+*.jpg    binary
+*.webp   binary

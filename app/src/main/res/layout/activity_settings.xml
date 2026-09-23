@@ -1,0 +1,1205 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true"
+    android:background="@color/app_bg">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/settings_title"
+            android:textColor="@color/app_text"
+            android:textSize="24sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:layout_marginBottom="14dp"
+            android:alpha="0.6"
+            android:text="@string/settings_subtitle"
+            android:textColor="@color/app_text"
+            android:textSize="13sp" />
+
+        <!-- Search: 50 controls is too many to scan by eye, and the section
+             names alone don't tell you where "double space period" lives. -->
+        <EditText
+            android:id="@+id/input_settings_search"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="10dp"
+            android:background="@drawable/bg_settings_inner"
+            android:drawableStart="@drawable/ic_keyboard_small"
+            android:drawablePadding="10dp"
+            android:hint="@string/settings_search_hint"
+            android:imeOptions="actionSearch"
+            android:inputType="text"
+            android:maxLines="1"
+            android:padding="12dp"
+            android:textColor="@color/app_text"
+            android:textColorHint="@color/app_text_secondary"
+            android:textSize="14sp" />
+
+        <!-- Simple/All switch: the whole page is collapsed to headings by
+             default, so 47 controls stop arriving all at once. -->
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/switch_settings_simple"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="2dp"
+            android:text="@string/settings_simple_mode" />
+
+        <TextView
+            style="@style/SettingsHint"
+            android:layout_marginBottom="10dp"
+            android:text="@string/settings_simple_hint" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_tutorial"
+            style="@style/Widget.Material3.Button.OutlinedButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:text="@string/settings_tutorial" />
+
+        <!-- ══════════ Keyboard layout ══════════ -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/bg_settings_card"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView style="@style/SettingsSection" android:text="@string/sec_layout" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_theme_studio"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="10dp"
+                android:text="@string/settings_theme_studio" />
+
+            <TextView style="@style/SettingsHint" android:text="@string/layout_intro" />
+
+            <TextView
+                style="@style/SettingsLabel"
+                android:text="@string/layout_letters" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_letter_layout"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/layout_letters" />
+
+            <TextView style="@style/SettingsHint" android:text="@string/layout_letters_hint" />
+
+            <TextView
+                android:id="@+id/label_key_spacing"
+                style="@style/SettingsLabel"
+                android:text="@string/layout_spacing" />
+
+            <SeekBar
+                android:id="@+id/seek_key_spacing"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content" />
+
+            <TextView style="@style/SettingsHint" android:text="@string/layout_spacing_hint" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_choose_keys"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="@string/settings_keys" />
+
+            <TextView style="@style/SettingsHint" android:text="@string/settings_keys_hint" />
+
+            <TextView
+                style="@style/SettingsLabel"
+                android:layout_marginTop="12dp"
+                android:text="@string/layout_bottom_row" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_key_emoji"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/layout_emoji_key" />
+
+            <TextView style="@style/SettingsHint" android:text="@string/layout_emoji_key_hint" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_key_comma"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/layout_comma_key" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_key_apostrophe"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/layout_apostrophe_key" />
+
+            <TextView style="@style/SettingsHint" android:text="@string/layout_apostrophe_hint" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_key_selection"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/layout_selection_key" />
+
+            <TextView style="@style/SettingsHint" android:text="@string/layout_selection_key_hint" />
+
+            <TextView
+                style="@style/SettingsLabel"
+                android:layout_marginTop="12dp"
+                android:text="@string/layout_symbols" />
+
+            <RadioGroup
+                android:id="@+id/symbols_density_group"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <RadioButton
+                    android:id="@+id/radio_symbols_roomy"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/layout_symbols_roomy" />
+
+                <RadioButton
+                    android:id="@+id/radio_symbols_complete"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/layout_symbols_complete" />
+            </RadioGroup>
+
+            <TextView style="@style/SettingsHint" android:text="@string/layout_symbols_hint" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_bracket_pos"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/layout_brackets" />
+
+            <TextView style="@style/SettingsHint" android:text="@string/layout_brackets_hint" />
+
+
+            <TextView
+                style="@style/SettingsLabel"
+                android:layout_marginTop="14dp"
+                android:text="@string/sec_features" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_swipe_learning"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/feat_swipe_learning" />
+
+            <TextView style="@style/SettingsHint" android:text="@string/feat_swipe_learning_hint" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_swipe_double"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/feat_swipe_double" />
+
+            <TextView style="@style/SettingsHint" android:text="@string/feat_swipe_double_hint" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_clip_history"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/feat_clip_history" />
+
+            <TextView style="@style/SettingsHint" android:text="@string/feat_clip_history_hint" />
+
+            <TextView
+                android:id="@+id/label_clip_expiry"
+                style="@style/SettingsLabel"
+                android:text="@string/feat_clip_expiry" />
+
+            <SeekBar
+                android:id="@+id/seek_clip_expiry"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_snippets"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/feat_snippets" />
+
+            <TextView style="@style/SettingsHint" android:text="@string/feat_snippets_hint" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_snippets"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/feat_snippets_edit" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_per_app_theme"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="@string/feat_per_app_theme" />
+
+            <TextView style="@style/SettingsHint" android:text="@string/feat_per_app_theme_hint" />
+
+            <TextView style="@style/SettingsLabel" android:text="@string/feat_one_handed" />
+
+            <RadioGroup
+                android:id="@+id/one_handed_group"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <RadioButton
+                    android:id="@+id/radio_oh_off"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/feat_oh_off" />
+
+                <RadioButton
+                    android:id="@+id/radio_oh_left"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/feat_oh_left" />
+
+                <RadioButton
+                    android:id="@+id/radio_oh_right"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/feat_oh_right" />
+            </RadioGroup>
+
+            <TextView
+                android:id="@+id/label_oh_width"
+                style="@style/SettingsLabel"
+                android:text="@string/feat_oh_width" />
+
+            <SeekBar
+                android:id="@+id/seek_oh_width"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content" />
+
+            <TextView
+                android:id="@+id/label_emoji_tone"
+                style="@style/SettingsLabel"
+                android:text="@string/feat_emoji_tone" />
+
+            <SeekBar
+                android:id="@+id/seek_emoji_tone"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_layout_reset"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="@string/layout_reset" />
+        </LinearLayout>
+
+        <!-- ══════════ AI model ══════════ -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/bg_settings_card"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView style="@style/SettingsSection" android:text="@string/sec_ai_model" />
+
+            <LinearLayout
+                android:id="@+id/model_list_container"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical" />
+
+            <TextView
+                style="@style/SettingsLabel"
+                android:layout_marginTop="12dp"
+                android:text="@string/settings_quick_model" />
+
+            <TextView
+                android:id="@+id/quick_model_value"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_settings_inner"
+                android:padding="12dp"
+                android:textColor="@color/app_text"
+                android:textSize="14sp" />
+
+            <TextView
+                style="@style/SettingsHint"
+                android:text="@string/settings_quick_model_hint" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal">
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_model_add_file"
+                    style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/settings_add_model_file" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_model_add_url"
+                    style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:text="@string/settings_add_model_url" />
+            </LinearLayout>
+
+            <TextView
+                style="@style/SettingsLabel"
+                android:layout_marginTop="14dp"
+                android:text="@string/ai_ctx_label" />
+
+            <RadioGroup
+                android:id="@+id/radio_ctx_group"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <RadioButton
+                    android:id="@+id/radio_ctx_1024"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/ai_ctx_1k" />
+
+                <RadioButton
+                    android:id="@+id/radio_ctx_2048"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/ai_ctx_2k" />
+
+                <RadioButton
+                    android:id="@+id/radio_ctx_4096"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/ai_ctx_4k" />
+
+                <RadioButton
+                    android:id="@+id/radio_ctx_8192"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/ai_ctx_8k" />
+            </RadioGroup>
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:alpha="0.6"
+                android:text="@string/ai_ctx_hint"
+                android:textAppearance="@style/TextAppearance.Material3.BodySmall" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_use_style_profile"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="@string/settings_use_style_profile" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_ai_test_lab"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/settings_ai_test_lab" />
+        </LinearLayout>
+
+        <!-- ══════════ Your style ══════════ -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/bg_settings_card"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView style="@style/SettingsSection" android:text="@string/sec_your_style" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_my_style"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_my_style" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_writing_profiles"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/settings_writing_profiles" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_calibrate"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/settings_calibrate" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_retrain"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/settings_retrain" />
+
+            <TextView
+                style="@style/SettingsLabel"
+                android:layout_marginTop="14dp"
+                android:text="@string/import_label" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_import_chat"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/import_chat_btn" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_import_dictionary"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/import_dict_btn" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:alpha="0.6"
+                android:text="@string/import_hint"
+                android:textAppearance="@style/TextAppearance.Material3.BodySmall" />
+        </LinearLayout>
+
+        <!-- ══════════ Typing feel (vibration / sound / animations) ══════════ -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/bg_settings_card"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView style="@style/SettingsSection" android:text="@string/sec_typing_feel" />
+
+            <TextView style="@style/SettingsLabel" android:text="@string/feel_vibration" />
+
+            <RadioGroup
+                android:id="@+id/radio_vib_group"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <RadioButton
+                    android:id="@+id/radio_vib_off"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/feel_off" />
+
+                <RadioButton
+                    android:id="@+id/radio_vib_light"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/feel_light" />
+
+                <RadioButton
+                    android:id="@+id/radio_vib_medium"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/feel_medium" />
+
+                <RadioButton
+                    android:id="@+id/radio_vib_strong"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/feel_strong" />
+            </RadioGroup>
+
+            <TextView style="@style/SettingsLabel" android:text="@string/feel_key_sound" />
+
+            <RadioGroup
+                android:id="@+id/radio_sound_group"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <RadioButton
+                    android:id="@+id/radio_sound_off"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/feel_off" />
+
+                <RadioButton
+                    android:id="@+id/radio_sound_soft"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/sound_soft" />
+
+                <RadioButton
+                    android:id="@+id/radio_sound_tactile"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/sound_tactile" />
+
+                <RadioButton
+                    android:id="@+id/radio_sound_bubble"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/sound_bubble" />
+            </RadioGroup>
+
+            <TextView
+                android:id="@+id/label_sound_volume"
+                style="@style/SettingsLabel"
+                android:text="@string/feel_sound_volume" />
+
+            <SeekBar
+                android:id="@+id/seek_sound_volume"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="100" />
+
+            <TextView style="@style/SettingsLabel" android:text="@string/feel_animations" />
+
+            <RadioGroup
+                android:id="@+id/radio_anim_group"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <RadioButton
+                    android:id="@+id/radio_anim_off"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/feel_off" />
+
+                <RadioButton
+                    android:id="@+id/radio_anim_reduced"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/anim_reduced" />
+
+                <RadioButton
+                    android:id="@+id/radio_anim_full"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/anim_full" />
+            </RadioGroup>
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_popup_preview"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_popup_preview" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_emoji_row"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_emoji_row" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_swipe_trail"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_swipe_trail" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_live_preview"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_live_preview" />
+        </LinearLayout>
+
+        <!-- ══════════ Typing ══════════ -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/bg_settings_card"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView style="@style/SettingsSection" android:text="@string/sec_typing" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_swipe"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_swipe" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_autocorrect"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_autocorrect" />
+
+            <TextView
+                android:id="@+id/label_ac_group"
+                style="@style/SettingsLabel"
+                android:text="@string/settings_ac_group" />
+
+            <RadioGroup
+                android:id="@+id/autocorrect_group"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_autospace"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_autospace" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_double_space"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_double_space" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_autocaps"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_autocaps" />
+
+            <TextView
+                android:id="@+id/label_swipe_sens"
+                style="@style/SettingsLabel"
+                android:text="@string/settings_swipe_sens" />
+
+            <SeekBar
+                android:id="@+id/seek_swipe_sens"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content" />
+
+            <TextView
+                android:id="@+id/label_longpress"
+                style="@style/SettingsLabel"
+                android:text="@string/settings_longpress" />
+
+            <SeekBar
+                android:id="@+id/seek_longpress"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content" />
+        </LinearLayout>
+
+        <!-- ══════════ Keyboard ══════════ -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/bg_settings_card"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView style="@style/SettingsSection" android:text="@string/sec_keyboard" />
+
+            <com.localboard.keyboard.ui.KeyboardPreviewView
+                android:id="@+id/keyboard_preview"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="8dp" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_number_row"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_number_row" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_digit_popups"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_digit_popups" />
+
+            <TextView
+                android:id="@+id/label_height"
+                style="@style/SettingsLabel"
+                android:text="@string/settings_height" />
+
+            <SeekBar
+                android:id="@+id/seek_height"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content" />
+
+            <TextView
+                android:id="@+id/label_textsize"
+                style="@style/SettingsLabel"
+                android:text="@string/settings_textsize" />
+
+            <SeekBar
+                android:id="@+id/seek_textsize"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content" />
+
+            <TextView
+                android:id="@+id/label_radius"
+                style="@style/SettingsLabel"
+                android:text="@string/settings_corner_radius" />
+
+            <SeekBar
+                android:id="@+id/seek_radius"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content" />
+
+            <TextView style="@style/SettingsLabel" android:text="@string/settings_palette" />
+
+            <HorizontalScrollView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:scrollbars="none">
+
+                <LinearLayout
+                    android:id="@+id/palette_gallery"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal" />
+            </HorizontalScrollView>
+
+            <TextView style="@style/SettingsLabel" android:text="@string/settings_press_effect" />
+
+            <RadioGroup
+                android:id="@+id/press_effect_group"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <RadioButton
+                    android:id="@+id/radio_pe_lift"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/press_effect_lift" />
+
+                <RadioButton
+                    android:id="@+id/radio_pe_bounce"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/press_effect_bounce" />
+
+                <RadioButton
+                    android:id="@+id/radio_pe_glow"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/press_effect_glow" />
+
+                <RadioButton
+                    android:id="@+id/radio_pe_none"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/press_effect_none" />
+            </RadioGroup>
+
+            <TextView style="@style/SettingsLabel" android:text="@string/settings_custom_colors" />
+
+            <TextView
+                android:id="@+id/label_custom_key_bg"
+                style="@style/SettingsLabel"
+                android:text="@string/settings_custom_key_bg" />
+
+            <EditText
+                android:id="@+id/input_custom_key"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="#FFFFFF"
+                android:inputType="text"
+                android:singleLine="true" />
+
+            <TextView
+                android:id="@+id/label_custom_text"
+                style="@style/SettingsLabel"
+                android:text="@string/settings_custom_text" />
+
+            <EditText
+                android:id="@+id/input_custom_text"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="#3E2E23"
+                android:inputType="text"
+                android:singleLine="true" />
+
+            <TextView
+                android:id="@+id/label_custom_bg"
+                style="@style/SettingsLabel"
+                android:text="@string/settings_custom_bg" />
+
+            <EditText
+                android:id="@+id/input_custom_bg"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="#EFE6D5"
+                android:inputType="text"
+                android:singleLine="true" />
+
+            <TextView
+                android:id="@+id/label_custom_accent"
+                style="@style/SettingsLabel"
+                android:text="@string/settings_custom_accent" />
+
+            <EditText
+                android:id="@+id/input_custom_accent"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="#C96F4A"
+                android:inputType="text"
+                android:singleLine="true" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal">
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_apply_custom"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/settings_apply_custom" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_clear_custom"
+                    style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:text="@string/settings_clear_custom" />
+            </LinearLayout>
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_motion"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_motion" />
+
+            <TextView style="@style/SettingsHint" android:text="@string/settings_motion_hint" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_wallpaper"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_wallpaper" />
+
+            <TextView
+                android:id="@+id/label_wallpaper_dim"
+                style="@style/SettingsLabel"
+                android:text="@string/settings_wallpaper_dim" />
+
+            <SeekBar
+                android:id="@+id/seek_wallpaper_dim"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="100" />
+        </LinearLayout>
+
+        <!-- ══════════ Learning & AI ══════════ -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/bg_settings_card"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView style="@style/SettingsSection" android:text="@string/sec_learning_ai" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_learn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_learn" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_typing_log"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_typing_log" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_overnight_distill"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_overnight" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_screen_stream"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_screen_stream" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_field_text"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_field_text" />
+
+            <LinearLayout
+                android:id="@+id/row_screen_context"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="@string/settings_screen_context"
+                        android:textColor="@color/app_text"
+                        android:textSize="16sp" />
+
+                    <TextView
+                        android:id="@+id/label_screen_context_detail"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:alpha="0.6"
+                        android:text="@string/settings_screen_context_detail"
+                        android:textColor="@color/app_text"
+                        android:textSize="12sp" />
+                </LinearLayout>
+
+                <com.google.android.material.materialswitch.MaterialSwitch
+                    android:id="@+id/switch_screen_context"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" />
+            </LinearLayout>
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_blocked_apps"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_blocked_apps" />
+        </LinearLayout>
+
+        <!-- ══════════ Voice typing ══════════ -->
+        <LinearLayout
+            android:id="@+id/voice_section"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/bg_settings_card"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView style="@style/SettingsSection" android:text="@string/sec_voice" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_voice_typing"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_voice" />
+
+            <TextView
+                android:id="@+id/voice_status"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:alpha="0.6"
+                android:textColor="@color/app_text"
+                android:textSize="12sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_voice_model"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/settings_voice_download" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_voice_permission"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/settings_voice_permission" />
+        </LinearLayout>
+
+        <!-- ══════════ Privacy ══════════ -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/bg_settings_card"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView style="@style/SettingsSection" android:text="@string/sec_privacy" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_privacy"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_privacy" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_data_controls"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/settings_data_controls" />
+
+            <TextView style="@style/SettingsHint" android:text="@string/settings_data_controls_hint" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_clear"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/settings_erase" />
+        </LinearLayout>
+
+        <!-- ══════════ Advanced ══════════ -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="24dp"
+            android:background="@drawable/bg_settings_card"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView style="@style/SettingsSection" android:text="@string/sec_advanced" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_advanced"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_advanced" />
+
+            <TextView
+                android:id="@+id/engine_status"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:alpha="0.6"
+                android:textColor="@color/app_text"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/diag_ai"
+                style="@style/SettingsLabel"
+                android:layout_marginTop="12dp"
+                android:text="@string/diag_title" />
+
+            <TextView
+                android:id="@+id/diag_ai_body"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:alpha="0.75"
+                android:textColor="@color/app_text"
+                android:textIsSelectable="true"
+                android:textSize="12sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_diag_copy"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="@string/diag_copy" />
+
+            <TextView
+                android:id="@+id/label_offset_x"
+                style="@style/SettingsLabel"
+                android:text="@string/settings_offset_x" />
+
+            <SeekBar
+                android:id="@+id/seek_offset_x"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content" />
+
+            <TextView
+                android:id="@+id/label_offset_y"
+                style="@style/SettingsLabel"
+                android:text="@string/settings_offset_y" />
+
+            <SeekBar
+                android:id="@+id/seek_offset_y"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content" />
+
+            <EditText
+                android:id="@+id/model_instructions"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:gravity="top"
+                android:hint="@string/settings_model_instructions"
+                android:inputType="textMultiLine"
+                android:minLines="2" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_reset_fingerfit"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/settings_reset_fingerfit" />
+        </LinearLayout>
+
+    </LinearLayout>
+</ScrollView>

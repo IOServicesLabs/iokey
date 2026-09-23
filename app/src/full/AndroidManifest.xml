@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  full distribution only — sideload, not the Play Store.
+
+  These two capabilities are deliberately absent from the Play build. Not
+  disabled by a flag: absent. The permission is not requested and the service
+  is not declared, so there is nothing for a Play reviewer to take on trust.
+
+    READ_SMS               a Play "restricted permission". Google grants it
+                           for a short published list of use cases; importing
+                           writing style is not one of them.
+
+    AccessibilityService   using the accessibility APIs for anything other
+                           than accessibility is a Play policy violation, and
+                           reading screen content to feed a language model is
+                           exactly what that rule targets.
+
+  See app/build.gradle.kts (productFlavors) and src/play/ for the stubs that
+  keep the shared code compiling without them.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Optional: only used if the user explicitly picks "Import my SMS
+         style" in onboarding. One-shot, read-only, sent messages only, and
+         the text never leaves the device. -->
+    <uses-permission
+        android:name="android.permission.READ_SMS"
+        tools:ignore="ProtectedPermissions" />
+
+    <application>
+
+        <!-- Optional screen-reading for AI context. OFF until the user
+             enables it in system Accessibility settings. RAM-only; nothing
+             is written to disk. -->
+        <service
+            android:name=".context.ScreenContextService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/screen_context_service" />
+        </service>
+    </application>
+</manifest>

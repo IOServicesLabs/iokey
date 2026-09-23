@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Dark counterparts of the app chrome colours. Settings was previously a
+  hard-coded light theme (Theme.Material3.Light), so opening it at night was
+  a full-brightness white sheet. Same mid-century family, inverted: warm
+  near-black paper, a lifted card surface, and a terracotta accent pushed
+  lighter so it still reads against the dark ground.
+-->
+<resources>
+    <color name="app_bg">#17140F</color>
+    <color name="app_surface">#221E18</color>
+    <color name="app_primary">#E58B63</color>
+    <color name="app_on_primary">#2A1710</color>
+    <color name="app_text">#EFE6D5</color>
+    <color name="app_text_secondary">#A9998A</color>
+</resources>

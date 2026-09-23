@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PRIVACY NOTICE: Typing data NEVER leaves this device. The app declares
+  INTERNET solely so the user can explicitly download the optional Qwen3-0.6B
+  neural model from Hugging Face (Settings -> Language model). No analytics,
+  no ads, no telemetry — network is used only for that user-initiated download.
+  Distribution-specific permissions (READ_SMS, and the accessibility
+  service used for on-screen AI context) live in src/full/AndroidManifest.xml
+  and are absent from the Play build entirely.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Used ONLY for the user-initiated one-time model download -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Per-key vibration feedback (Vibrator service). A normal permission,
+         granted at install — no runtime prompt. Missing it made KeyFeedback's
+         vibrate() calls throw SecurityException into a silent catch: the
+         "vibration is broken" regression. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Reading the system personal dictionary (where Gboard's "add to
+         dictionary" puts words) for the one-tap dictionary import. -->
+    <uses-permission android:name="android.permission.READ_USER_DICTIONARY" />
+
+
+    <!-- Optional: offline voice typing, requested only when the user taps
+         the mic. Audio is transcribed on-device; it never leaves the phone. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- Optional: only used if the user turns on "learn contact names" so
+         proper nouns stop being autocorrected away. Names are tokenised into
+         the local encrypted dictionary; no other contact field is read, and
+         nothing is uploaded. -->
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+
+    <!-- Android 11+ package visibility: lets the in-app diagnostic see which
+         input methods the system has indexed (our own service is always
+         visible to us regardless). -->
+    <queries>
+        <intent>
+            <action android:name="android.view.InputMethod" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".LocalBoardApp"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:dataExtractionRules="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.LocalBoard">
+
+        <!-- The Input Method Service -->
+        <service
+            android:name="com.localboard.keyboard.ime.LLMKeyboardService"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_INPUT_METHOD"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <!--
+              CRITICAL: the meta-data name MUST be "android.view.im" — that is the
+              exact value of android.view.inputmethod.InputMethod.SERVICE_META_DATA
+              (verified against android-34 android.jar). The widely-copied string
+              "android.view.input_method" is WRONG: the system then finds no
+              meta-data, silently drops the IME, and the keyboard never appears
+              in any keyboard list on any device.
+            -->
+            <meta-data
+                android:name="android.view.im"
+                android:resource="@xml/method" />
+        </service>
+
+        <!-- Onboarding / first-run experience -->
+        <activity
+            android:name=".onboarding.OnboardingActivity"
+            android:exported="true"
+            android:theme="@style/Theme.LocalBoard">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 60-second tour: shown once after onboarding, replayable from Settings -->
+        <activity
+            android:name=".onboarding.TutorialActivity"
+            android:exported="false"
+            android:label="@string/tutorial_title"
+            android:theme="@style/Theme.LocalBoard" />
+
+        <!-- Settings -->
+        <activity
+            android:name=".settings.SettingsActivity"
+            android:exported="false"
+            android:label="@string/settings_title"
+            android:theme="@style/Theme.LocalBoard" />
+
+        <!-- Theme studio: live-preview colour editor + saved/shared themes -->
+        <activity
+            android:name=".settings.ThemeStudioActivity"
+            android:exported="false"
+            android:label="@string/theme_studio_title"
+            android:theme="@style/Theme.LocalBoard" />
+
+        <!-- Upgrade screen: what is free, what Pro adds, and the purchase -->
+        <activity
+            android:name=".settings.ProActivity"
+            android:exported="false"
+            android:label="IOKey Pro"
+            android:theme="@style/Theme.LocalBoard" />
+
+        <!-- Key customiser: presets + per-key switches with a live preview -->
+        <activity
+            android:name=".settings.KeyLayoutActivity"
+            android:exported="false"
+            android:label="@string/settings_keys"
+            android:theme="@style/Theme.LocalBoard" />
+
+        <!-- Animated background styles + render/battery counters -->
+        <activity
+            android:name=".settings.MotionActivity"
+            android:exported="false"
+            android:label="@string/settings_motion"
+            android:theme="@style/Theme.LocalBoard" />
+
+        <!-- Data & network controls: kill switch, egress ledger, per-app
+             rules, backup/restore, contact-name import, crash log -->
+        <activity
+            android:name=".settings.PrivacyActivity"
+            android:exported="false"
+            android:label="@string/settings_data_controls"
+            android:theme="@style/Theme.LocalBoard" />
+
+        <!-- Writing style & learned dictionary viewer -->
+        <activity
+            android:name=".settings.StyleActivity"
+            android:exported="false"
+            android:label="My writing style"
+            android:theme="@style/Theme.LocalBoard" />
+
+        <!-- AI Test Lab: scripted conversation A/B harness -->
+        <activity
+            android:name=".settings.AiTestLabActivity"
+            android:exported="false"
+            android:label="@string/test_lab_title"
+            android:theme="@style/Theme.LocalBoard" />
+
+        <!-- Finger-fit calibration game -->
+        <activity
+            android:name=".settings.CalibrateActivity"
+            android:exported="false"
+            android:label="Fit keyboard to your fingers"
+            android:theme="@style/Theme.LocalBoard" />
+
+        <!-- Transparent trampoline so the keyboard can request the mic
+             permission for offline voice typing -->
+        <activity
+            android:name=".settings.VoicePermissionActivity"
+            android:exported="false"
+            android:label=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+    </application>
+</manifest>

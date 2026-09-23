@@ -1,0 +1,80 @@
+/* Shared styling for the hosted policy pages.
+   Deliberately one small stylesheet with no external fonts, no analytics and
+   no third-party requests — it would be a poor look for a privacy app's
+   privacy policy to load a tracker. */
+
+:root {
+    --bg: #ffffff;
+    --fg: #1a1c1e;
+    --muted: #5c6066;
+    --rule: #e3e5e8;
+    --accent: #1f6feb;
+    --card: #f6f8fa;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #0f1214;
+        --fg: #e6e8ea;
+        --muted: #9aa0a6;
+        --rule: #262b30;
+        --accent: #6ea8ff;
+        --card: #171b1f;
+    }
+}
+
+* { box-sizing: border-box; }
+
+body {
+    margin: 0;
+    padding: 2.5rem 1.25rem 5rem;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+    -webkit-text-size-adjust: 100%;
+}
+
+main { max-width: 46rem; margin: 0 auto; }
+
+h1 { font-size: 1.9rem; line-height: 1.2; margin: 0 0 .4rem; letter-spacing: -.02em; }
+h2 { font-size: 1.25rem; margin: 2.6rem 0 .75rem; padding-top: 1.4rem; border-top: 1px solid var(--rule); letter-spacing: -.01em; }
+h3 { font-size: 1.02rem; margin: 1.8rem 0 .5rem; }
+h2:first-of-type { border-top: 0; padding-top: 0; }
+
+p, li { color: var(--fg); }
+a { color: var(--accent); }
+
+.meta { color: var(--muted); font-size: .9rem; margin: 0 0 2rem; }
+.meta strong { color: var(--fg); }
+
+.lede {
+    background: var(--card);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+    padding: 1.1rem 1.25rem;
+    margin: 0 0 2rem;
+}
+.lede p:first-child { margin-top: 0; }
+.lede p:last-child { margin-bottom: 0; }
+
+.note {
+    border-left: 3px solid var(--accent);
+    background: var(--card);
+    padding: .85rem 1rem;
+    border-radius: 0 8px 8px 0;
+    margin: 1.25rem 0;
+}
+
+/* Tables carry most of the detail here, and phones are narrow. Let them
+   scroll inside their own box rather than making the page scroll sideways. */
+.tablewrap { overflow-x: auto; margin: 1.25rem 0; }
+table { border-collapse: collapse; width: 100%; min-width: 32rem; font-size: .93rem; }
+th, td { text-align: left; padding: .6rem .7rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-weight: 600; white-space: nowrap; }
+code { background: var(--card); padding: .12em .4em; border-radius: 4px; font-size: .88em; }
+
+footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--rule); color: var(--muted); font-size: .88rem; }
+footer a { color: var(--muted); }
+
+.backlink { display: inline-block; margin-bottom: 1.5rem; font-size: .9rem; }

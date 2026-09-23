@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Optional, off by default: the user enables it in system Accessibility
+     settings. Lets the AI read the conversation that is VISIBLE on screen
+     (both sides of a chat), which the input connection alone can never see.
+     Text is held in memory only, never written to disk. -->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:canRetrieveWindowContent="true"
+    android:notificationTimeout="1200"
+    android:description="@string/screen_context_service_desc" />

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/keyboard_root"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical">
+
+    <com.localboard.keyboard.ui.PredictionBarView
+        android:id="@+id/prediction_bar"
+        android:layout_width="match_parent"
+        android:layout_height="@dimen/prediction_bar_height" />
+
+    <LinearLayout
+        android:id="@+id/emoji_row"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:visibility="gone" />
+
+    <FrameLayout
+        android:id="@+id/keyboard_container"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content" />
+
+    <!-- Fills the area behind the system navigation bar, which the IME window
+         extends into from API 35. Height is 0 until the first inset dispatch
+         says how tall the bar actually is, and stays 0 where it takes no
+         space. Decorative only - the touchable region set in onComputeInsets
+         excludes it, so it never receives a tap. -->
+    <com.localboard.keyboard.ui.NavStripView
+        android:id="@+id/nav_strip"
+        android:layout_width="match_parent"
+        android:layout_height="0dp" />
+</LinearLayout>

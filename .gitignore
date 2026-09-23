@@ -1,0 +1,39 @@
+# ── Build output ─────────────────────────────────────────────────────────
+build/
+app/build/
+.gradle/
+.kotlin/
+*.apk
+*.aab
+*.ap_
+*.dex
+captures/
+.externalNativeBuild/
+.cxx/
+
+# ── Machine-local ────────────────────────────────────────────────────────
+# Points at this PC's SDK. Gradle regenerates it; committing it breaks
+# everyone else's build and every CI runner.
+local.properties
+
+# ── Signing material — NEVER COMMIT ──────────────────────────────────────
+# The release key is what lets an APK install as an update over an existing
+# install. Anyone holding it can publish something that replaces this app on
+# a user's phone. It lives outside the repo: locally in keystore.properties,
+# in CI as a GitHub Secret. See BUILD.md.
+keystore.properties
+*.keystore
+*.jks
+!app/debug.keystore
+
+# ── IDE ──────────────────────────────────────────────────────────────────
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# ── Editor / scratch ─────────────────────────────────────────────────────
+*.bak
+*.orig
+*.tmp
+*~

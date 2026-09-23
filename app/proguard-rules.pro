@@ -1,0 +1,4 @@
+-keep class androidx.room.** { *; }
+-keep class * extends androidx.room.RoomDatabase { *; }
+-keepclassmembers class * { @androidx.room.* <methods>; }
+-dontwarn net.sqlcipher.**
