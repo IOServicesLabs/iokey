@@ -57,6 +57,14 @@ object LlamaCppBridge {
 
     fun isGenerating(slot: Int): Boolean = slotGenerating[slot].get()
     fun setGenerating(slot: Int, v: Boolean) { slotGenerating[slot].set(v) }
+
+    private val slotReleaseWanted =
+        java.util.concurrent.atomic.AtomicReferenceArray<String?>(SLOT_COUNT)
+
+    /** An unload that a running decode stood in the way of: why it was wanted, until that run ends.
+     *  Process-wide like the rest, since the run may belong to another provider instance. */
+    fun setReleaseWanted(slot: Int, reason: String?) { slotReleaseWanted.set(slot, reason) }
+    fun takeReleaseWanted(slot: Int): String? = slotReleaseWanted.getAndSet(slot, null)
     fun loadedPath(slot: Int): String? = slotLoadedPath.get(slot)
     fun loadedCtx(slot: Int): Int = slotLoadedCtx.get(slot)
     fun setLoadedPath(slot: Int, path: String?) { slotLoadedPath.set(slot, path) }

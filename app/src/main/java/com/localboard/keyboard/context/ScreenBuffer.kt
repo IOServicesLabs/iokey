@@ -1,5 +1,9 @@
 package com.localboard.keyboard.context
 
+import com.localboard.keyboard.memory.Speaker
+import com.localboard.keyboard.memory.TranscriptMerger
+import com.localboard.keyboard.memory.Turn
+
 /**
  * Shared between both distributions ON PURPOSE.
  *
@@ -22,6 +26,7 @@ object ScreenBuffer {
     private const val MAX_APPS = 6
     private const val MAX_SCREENS = 12
     private const val FRESH_MS = 10 * 60_000L
+    private const val FORGET_HOLD_MS = 10_000L
 
     @Volatile
     var serviceRunning = false
@@ -74,10 +79,37 @@ object ScreenBuffer {
         }
     }
 
-    private data class Entry(val ts: Long, val key: String, val text: String)
+    private class Entry(val ts: Long, val key: String, val turns: List<Turn>) {
+        val text: String = render(turns)
+    }
+
+    private fun lineOf(t: Turn): String = when (t.speaker) {
+        Speaker.ME -> "You: " + t.text
+        Speaker.THEM -> "Them: " + t.text
+        Speaker.UNKNOWN -> t.text
+    }
+
+    private fun render(turns: List<Turn>): String = turns.joinToString("\n") { lineOf(it) }
+
+    /** The newest whole lines that fit: a cut line would lose its speaker. */
+    private fun capToNewest(turns: List<Turn>): List<Turn> {
+        var chars = 0
+        var from = turns.size
+        while (from > 0) {
+            chars += lineOf(turns[from - 1]).length + 1
+            if (chars > MAX_CHARS && from < turns.size) break
+            from--
+        }
+        return turns.subList(from, turns.size).toList()
+    }
 
     private val map = LinkedHashMap<String, Entry>(MAX_APPS, 0.75f, true)
     private val byScreen = LinkedHashMap<String, Entry>(MAX_SCREENS, 0.75f, true)
+    private val refusedUntil = HashMap<String, Long>()
+
+    /** What a refusal is timed by: a wall clock set back would stretch it. A function so that the
+     *  rules can be tested off the device. */
+    internal var elapsedMs: () -> Long = { android.os.SystemClock.elapsedRealtime() }
 
     /** Number of apps currently buffered (diagnostics). */
     @Synchronized
@@ -91,56 +123,51 @@ object ScreenBuffer {
         return System.currentTimeMillis() - newest.ts
     }
 
+    /**
+     * Takes one capture of the visible chat, oldest line first. [atBottom] is false while
+     * the list can still scroll forward, that is, while the user is reading history.
+     *
+     * Captures of one conversation accumulate, so scrolling a chat with the keyboard up
+     * builds it up instead of only ever holding the last visible slice. They line up by
+     * position, so a fresh "ok" is kept even when "ok" was said before.
+     */
     @Synchronized
-    fun put(pkg: String, rawText: String, threadKey: String = "") {
+    fun put(pkg: String, capture: List<Turn>, threadKey: String = "", atBottom: Boolean = true) {
         if (pkg in noScreenPackages) return
+        refusedUntil[pkg]?.let { until ->
+            if (elapsedMs() < until) return
+            refusedUntil.remove(pkg)
+        }
         // Redact BEFORE storing, never on read: anything that reaches the map
         // is one bug away from reaching a prompt, a log or the AI diagnostic.
-        val text = if (redactEnabled) redact(rawText) else rawText
+        val clean = capture
+            .map { if (redactEnabled) it.copy(text = redact(it.text)) else it }
+            .filter { it.text.isNotBlank() }
+        if (clean.isEmpty()) return
         val now = System.currentTimeMillis()
-        val prev = map[pkg]
-        val capped: String
-        if (prev == null) {
-            capped = text.takeLast(MAX_CHARS)
-        } else {
-            val prevLines = prev.text.lineSequence()
-                .map { it.trim() }.filter { it.isNotBlank() }.toSet()
-            val newLines = text.lineSequence()
-                .map { it.trim() }.filter { it.isNotBlank() }.toList()
-            val shared = newLines.count { it in prevLines }
-            capped = if (shared == 0 && newLines.isNotEmpty() && prevLines.isNotEmpty()) {
-                // A completely different screen (switched conversations):
-                // REPLACE, don't merge two chats into mush.
-                text.takeLast(MAX_CHARS)
-            } else {
-                // Same conversation, overlapping captures: ACCUMULATE with
-                // positional anchoring. One capture per screen used to
-                // REPLACE the buffer, so scrolling a chat with the keyboard
-                // up never built a conversation — the AI only ever saw the
-                // last visible slice. Anchor on the first new line that
-                // already exists: unseen lines above it scrolled in from the
-                // top (prepend), unseen lines below it are new (append).
-                val prevList = prev.text.lineSequence()
-                    .map { it.trim() }.filter { it.isNotBlank() }.toList()
-                val anchor = newLines.indexOfFirst { it in prevLines }
-                val merged = ArrayList<String>(prevList.size + newLines.size + 8)
-                if (anchor > 0) merged.addAll(newLines.subList(0, anchor))
-                merged.addAll(prevList)
-                val tailStart = if (anchor >= 0) anchor + 1 else 0
-                val prevSet = prevLines
-                for (i in tailStart until newLines.size) {
-                    val l = newLines[i]
-                    if (l !in prevSet) merged.add(l)
-                }
-                merged.joinToString("\n").takeLast(MAX_CHARS)
-            }
+        // A named conversation only ever merges with itself: one line in common is not
+        // enough to pour two people's chats together. What has gone stale is not brought
+        // back to life by a merge.
+        val prev = (if (threadKey.isBlank()) map[pkg] else byScreen["$pkg|$threadKey"])
+            ?.takeIf { now - it.ts <= FRESH_MS }
+        val merge = prev?.let { TranscriptMerger.merge(it.turns, clean, atBottom) }
+        val turns = when {
+            prev == null || merge == null -> clean
+            // Scrolled far up in a chat we can name: what we hold is still its newest
+            // lines. With no name this could be any other screen, and showing a draft the
+            // wrong person's chat is worse than an older part of the right one.
+            merge.disjoint -> if (atBottom || threadKey.isBlank()) clean else prev.turns
+            else -> merge.older + prev.turns + merge.newer
         }
-        // B2: the stable thread key (toolbar title / window title) is the
-        // conversation identity; the first-line fallback only fires when a
-        // capture carried no title at all.
-        val e = Entry(now, threadKey.ifBlank { screenKeyOf(capped) }, capped)
+        val capped = capToNewest(turns)
+        // The stable thread key (toolbar title / window title) is the
+        // conversation identity. A capture with no title keeps the name of the
+        // chat it lines up with, and otherwise has no name: its first line is a
+        // message now, and readers of this key write it to disk.
+        val key = threadKey.ifBlank { prev?.takeIf { merge?.disjoint == false }?.key.orEmpty() }
+        val e = Entry(now, key, capped)
         map[pkg] = e
-        byScreen["$pkg|" + e.key] = e
+        if (key.isNotEmpty()) byScreen["$pkg|$key"] = e
         while (map.size > MAX_APPS) {
             val eldest = map.keys.firstOrNull() ?: break
             map.remove(eldest)
@@ -158,8 +185,7 @@ object ScreenBuffer {
         return e.text.takeLast(maxChars)
     }
 
-    /** The first meaningful line of the app's freshest capture — a stand-in
-     *  for "which screen/conversation this is" (chat titles sit at the top).
+    /** Which conversation the app's freshest capture is of, by its title.
      *  "" when unknown or stale. */
     @Synchronized
     fun currentScreenKey(pkg: String): String {
@@ -178,9 +204,6 @@ object ScreenBuffer {
         return e.text.takeLast(maxChars)
     }
 
-    private fun screenKeyOf(text: String): String =
-        text.lineSequence().firstOrNull { it.isNotBlank() }?.trim()?.take(48) ?: ""
-
     @Synchronized
     fun clear(pkg: String) {
         map.remove(pkg)
@@ -188,6 +211,28 @@ object ScreenBuffer {
         while (it.hasNext()) {
             if (it.next().key.startsWith("$pkg|")) it.remove()
         }
+    }
+
+    /**
+     * Drops everything held for an app, its title included, and refuses captures of it for a
+     * moment: a walk of the screen already under way cannot be called back, and would otherwise
+     * put the same text straight back when it lands.
+     */
+    @Synchronized
+    fun forget(pkg: String) {
+        clear(pkg)
+        refusedUntil[pkg] = elapsedMs() + FORGET_HOLD_MS
+    }
+
+    /**
+     * A tap has asked for a new read of this app, and that outranks the refusal left by the last
+     * [forget]: a retry would otherwise draft with no chat at all, and each retry would start the
+     * refusal over. Queued walks went with that forget. One still running is cleared by the forget
+     * of the draft asking now, in a field where that matters.
+     */
+    @Synchronized
+    fun allowRead(pkg: String) {
+        refusedUntil.remove(pkg)
     }
 
     @Synchronized

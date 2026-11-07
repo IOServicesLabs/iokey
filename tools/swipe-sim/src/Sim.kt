@@ -1,158 +1,36 @@
 import android.content.Context
-import android.graphics.PointF
-import android.graphics.RectF
 import com.localboard.keyboard.engine.FastEngine
-import com.localboard.keyboard.engine.KeyboardGeometry
 import com.localboard.keyboard.engine.SwipeDecoder
 import kotlinx.coroutines.runBlocking
 import java.io.File
 import kotlin.math.max
-import kotlin.math.sqrt
 import kotlin.random.Random
 
-/** Offline glide-typing harness: synthesises sloppy human-like gestures for
- *  real dictionary words (with and without a previous-word context) and
- *  measures the decoder's top-1 / top-3 accuracy and latency. */
+/** Offline glide-typing harness. This part measures single dictionary words, half of them
+ *  with a previous word chosen so the language model knows the pair, which flatters context.
+ *  Gates is the measure that resembles use. */
 object Sim {
-    const val KW = 100f
-    const val KH = 128f
-    val ROWS = listOf("qwertyuiop", "asdfghjkl", "zxcvbnm")
-    val ROW_OFF = floatArrayOf(0f, 0.5f, 1.5f)
-
-    lateinit var geom: KeyboardGeometry
-    val centre = HashMap<Char, PointF>()
-
-    fun buildGeometry() {
-        geom = KeyboardGeometry()
-        geom.clear()
-        for (r in ROWS.indices) {
-            val row = ROWS[r]
-            for (i in row.indices) {
-                val left = (ROW_OFF[r] + i) * KW
-                val top = r * KH
-                val rect = RectF(left, top, left + KW, top + KH)
-                geom.register(row[i], rect)
-                centre[row[i]] = PointF(rect.centerX(), rect.centerY())
-            }
-        }
-        geom.finishLayout()
-    }
-
-    class Noise(val pos: Float, val cut: Float, val jitter: Float, val dwellP: Float, val name: String)
-
-    val NOISES = listOf(
-        Noise(0.18f, 0.25f, 0.02f, 0.7f, "clean"),
-        Noise(0.28f, 0.45f, 0.03f, 0.5f, "normal"),
-        Noise(0.38f, 0.6f, 0.04f, 0.3f, "sloppy")
-    )
-
-    fun gauss(rnd: Random, s: Float): Float = (rnd.nextDouble() * 2 - 1 + rnd.nextDouble() * 2 - 1 + rnd.nextDouble() * 2 - 1).toFloat() * s * 0.8f
-
-    /** Synthesise one gesture for [word]. */
-    fun gesture(word: String, nz: Noise, rnd: Random): List<PointF> {
-        val n = word.length
-        val tx = FloatArray(n)
-        val ty = FloatArray(n)
-        for (i in 0 until n) {
-            val c = centre[word[i]]!!
-            tx[i] = c.x + gauss(rnd, nz.pos * KW)
-            ty[i] = c.y + gauss(rnd, nz.pos * KH)
-        }
-        // Corner cutting for interior letters.
-        for (i in 1 until n - 1) {
-            if (word[i] == word[i - 1] || word[i] == word[i + 1]) continue
-            // Humans round gentle corners but cannot skip a reversal: the
-            // cut scales with sin(turn angle), zero for a straight-back turn.
-            val ax = tx[i] - tx[i - 1]; val ay = ty[i] - ty[i - 1]
-            val bx = tx[i + 1] - tx[i]; val by = ty[i + 1] - ty[i]
-            val la = sqrt(ax * ax + ay * ay); val lb = sqrt(bx * bx + by * by)
-            if (la < 1f || lb < 1f) continue
-            val cross = kotlin.math.abs(ax * by - ay * bx) / (la * lb)   // sin(angle)
-            val f = rnd.nextFloat() * nz.cut * cross
-            val mx = (tx[i - 1] + tx[i + 1]) / 2f
-            val my = (ty[i - 1] + ty[i + 1]) / 2f
-            tx[i] += (mx - tx[i]) * f
-            ty[i] += (my - ty[i]) * f
-        }
-        // Collapse repeated letters into one target, remembering dwell spots.
-        val px = ArrayList<Float>()
-        val py = ArrayList<Float>()
-        val dwell = ArrayList<Boolean>()
-        for (i in 0 until n) {
-            if (i > 0 && word[i] == word[i - 1]) {
-                dwell[dwell.size - 1] = true
-                continue
-            }
-            px += tx[i]; py += ty[i]; dwell += false
-        }
-        val m = px.size
-        val out = ArrayList<PointF>()
-        // Touch-down rest.
-        repeat(3) { out += PointF(px[0] + gauss(rnd, 1f), py[0] + gauss(rnd, 1f)) }
-        if (m == 1) {
-            repeat(4) { out += PointF(px[0] + gauss(rnd, 2f), py[0] + gauss(rnd, 2f)) }
-            return out
-        }
-        // Catmull-Rom through the targets, sampled every ~0.08 key widths.
-        fun cr(p0: Float, p1: Float, p2: Float, p3: Float, t: Float): Float {
-            val t2 = t * t; val t3 = t2 * t
-            return 0.5f * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3)
-        }
-        for (i in 0 until m - 1) {
-            val x0 = px[max(0, i - 1)]; val y0 = py[max(0, i - 1)]
-            val x1 = px[i]; val y1 = py[i]
-            val x2 = px[i + 1]; val y2 = py[i + 1]
-            val x3 = px[minOf(m - 1, i + 2)]; val y3 = py[minOf(m - 1, i + 2)]
-            val segLen = sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1))
-            val steps = max(2, (segLen / (0.08f * KW)).toInt())
-            for (s in 0 until steps) {
-                val t = s.toFloat() / steps
-                val x = cr(x0, x1, x2, x3, t) + gauss(rnd, nz.jitter * KW)
-                val y = cr(y0, y1, y2, y3, t) + gauss(rnd, nz.jitter * KW)
-                out += PointF(x, y)
-            }
-            // Dwell at a doubled letter (the target we just LEFT was the
-            // doubled one when i's dwell flag is set) — emitted at the start
-            // of the segment, i.e. while still on that key.
-            if (dwell[i] && i > 0 && rnd.nextFloat() < nz.dwellP) {
-                val at = out.size - steps
-                val dx = px[i]; val dy = py[i]
-                val ins = ArrayList<PointF>()
-                repeat(7) { ins += PointF(dx + gauss(rnd, 2.5f), dy + gauss(rnd, 2.5f)) }
-                out.addAll(at, ins)
-            }
-        }
-        out += PointF(px[m - 1], py[m - 1])
-        // Lift rest.
-        repeat(3) { out += PointF(px[m - 1] + gauss(rnd, 1.5f), py[m - 1] + gauss(rnd, 1.5f)) }
-        // Thin like the view does (>= 2 px apart).
-        val thin = ArrayList<PointF>()
-        for (p in out) {
-            if (thin.isEmpty()) { thin += p; continue }
-            val l = thin.last()
-            val d = sqrt((p.x - l.x) * (p.x - l.x) + (p.y - l.y) * (p.y - l.y))
-            if (d >= 2f) thin += p
-        }
-        if (thin.last() !== out.last()) thin += out.last()
-        return thin
-    }
+    val board by lazy { deviceBoard() }
 
     data class Case(val word: String, val prev: String?)
 
     @JvmStatic
     fun main(args: Array<String>) {
         val assets = File(args[0])
+        if (args.getOrNull(1) == "gates") {
+            Gates.run(assets, args.drop(2))
+            return
+        }
         val nCases = args.getOrNull(1)?.toIntOrNull() ?: 600
         val seed = args.getOrNull(2)?.toIntOrNull() ?: 42
         val ctx = Context(assets)
         val engine = FastEngine(ctx)
         runBlocking { engine.loadBaseDictionary(); engine.loadBaseLanguageModel() }
-        buildGeometry()
-        val decoder = SwipeDecoder(engine, geom)
+        val decoder = SwipeDecoder(engine, board.geom)
         // Force the table build synchronously via warmUp + wait.
         decoder.warmUp()
         var waited = 0
-        while (decoder.decode(gesture("hello", NOISES[0], Random(1)), 1).isEmpty() && waited < 200) {
+        while (decoder.decode(gesture("hello", board, NOISES[0], IDEAL, Random(1)), 1).isEmpty() && waited < 200) {
             Thread.sleep(50); waited++
         }
         val rnd = Random(seed)
@@ -233,7 +111,7 @@ object Sim {
             var ms = 0.0; var maxMs = 0.0
             val misses = ArrayList<String>()
             for (c in cases) {
-                val g = gesture(c.word, nz, rnd)
+                val g = gesture(c.word, board, nz, IDEAL, rnd)
                 val prev = if (useCtx) c.prev else null
                 val t0 = System.nanoTime()
                 val res = decoder.decode(g, 4, prev)

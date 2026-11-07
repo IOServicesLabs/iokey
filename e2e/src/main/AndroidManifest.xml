@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:allowBackup="false"
+        android:label="IOKey E2E host"
+        android:supportsRtl="false"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <!--
+          Every configuration change is handled in place. A rotation or density change must not recreate
+          this window: recreating it restarts input, and a restart hides exactly the keyboard window
+          states the inset tests exist to catch. adjustNothing keeps the fields where they are while the
+          keyboard is up, so a touch below the keyboard's touchable area always lands on this activity.
+        -->
+        <activity
+            android:name=".HostActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|uiMode|fontScale|keyboard|keyboardHidden|navigation|layoutDirection|locale|colorMode|touchscreen|mcc|mnc|assetsPaths"
+            android:exported="true"
+            android:screenOrientation="unspecified"
+            android:windowSoftInputMode="adjustNothing|stateHidden" />
+
+        <activity
+            android:name=".RecreatingHostActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustNothing|stateHidden" />
+
+        <activity
+            android:name=".ImmersiveHostActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|uiMode|fontScale|keyboard|keyboardHidden|navigation|layoutDirection|locale|colorMode|touchscreen|mcc|mnc|assetsPaths"
+            android:exported="true"
+            android:windowSoftInputMode="adjustNothing|stateHidden" />
+    </application>
+</manifest>

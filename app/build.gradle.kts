@@ -71,8 +71,8 @@ android {
         // force an uninstall and take the user's learned dictionary with it.
         // The pre-1.0 builds reached 52, so 1.0.0 maps to 10000 under
         // major*10000 + minor*100 + patch: monotonic, and readable at a glance.
-        versionCode = 10100
-        versionName = "1.1.0"
+        versionCode = 10200
+        versionName = "1.2.0"
 
         ndk {
             // Modern phones only; keeps APK size and build time sane.
@@ -180,6 +180,18 @@ android {
             excludes += setOf("META-INF/DEPENDENCIES", "META-INF/LICENSE", "META-INF/LICENSE.txt", "META-INF/NOTICE", "META-INF/NOTICE.txt")
         }
     }
+
+    testOptions {
+        unitTests.all { test ->
+            // A check that fails is named in the build log, not just in a report file, and the
+            // count the suites print is there too.
+            test.testLogging {
+                events("failed")
+                exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+                showStandardStreams = true
+            }
+        }
+    }
 }
 
 dependencies {
@@ -215,4 +227,9 @@ dependencies {
     // build means the sideload APK carries no store client at all, rather
     // than one that is present but inert.
     "playImplementation"("com.android.billingclient:billing-ktx:7.1.1")
+
+    // JVM tests for logic with no Android in it. sqlite-jdbc lets the SQL behind
+    // the personal model run on a real SQLite without a device.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.xerial:sqlite-jdbc:3.41.2.2")
 }

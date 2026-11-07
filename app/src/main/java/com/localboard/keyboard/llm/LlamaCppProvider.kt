@@ -2,8 +2,13 @@ package com.localboard.keyboard.llm
 
 import android.content.Context
 import com.localboard.keyboard.context.StyleProfile
+import com.localboard.keyboard.memory.ControlTokens
 import com.localboard.keyboard.util.Prefs
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -76,7 +81,12 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
      *  lane's tiny autocorrect model stays on llama.cpp). Dispatching here,
      *  inside the neural provider, means the ✨ button, the AI test lab and
      *  the nightly distiller all get LEAP routing with zero call-site churn. */
-    private val leap = LeapEngine(context)
+    private val leap = LeapEngine.shared
+
+    /** A run of this instance is inside a native decode on the draft lane. A run that is
+     *  only queued has nothing in native to stop, and must not stop whoever it is behind. */
+    @Volatile
+    private var draftDecodingHere = false
 
     /** Last time a generation ran (or a model was loaded). The idle unload
      *  watchdog reads this — a model nobody is drafting with is gigabytes
@@ -105,7 +115,10 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
             // start a decode between the check and nativeFree otherwise.
             synchronized(LlamaCppBridge.slotMonitor(lane.slot)) {
                 if (lane.generating) {
-                    // Never free under a running decode (native use-after-free).
+                    // Never free under a running decode (native use-after-free). A stopped
+                    // run can sit in native for a long while with the keyboard hidden, and
+                    // nothing else would come back for this memory, so that run's end does.
+                    LlamaCppBridge.setReleaseWanted(lane.slot, reason)
                     AiDiagLog.lastLoadEvent =
                         "unload skipped ($reason) — $name gen in flight"
                     return
@@ -117,6 +130,18 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
             AiDiagLog.lastLoadEvent = "$name model unloaded ($reason) — will reload on next use"
         }
     }
+
+    /** A run has ended, cancelled or not: the unload it stood in the way of, unless someone
+     *  came back for the model since. Asking for a run takes the request back. */
+    private suspend fun releaseIfWanted(lane: Lane, name: String) {
+        // Off the caller's thread: a draft's caller is the keyboard's main thread.
+        withContext(Dispatchers.IO + NonCancellable) {
+            LlamaCppBridge.takeReleaseWanted(lane.slot)?.let { releaseLane(lane, name, it) }
+            if (lane === draftLane) leap.releaseIfWanted()
+        }
+    }
+
+    private fun nameOf(lane: Lane) = if (lane === draftLane) "draft" else "quick"
 
     fun idleSince(now: Long): Long = if (lastUseAt == 0L) Long.MAX_VALUE else now - lastUseAt
 
@@ -152,14 +177,15 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
         val spec = ModelRegistry.quick(prefs)
         if (!ModelRegistry.isReady(context, spec)) throw IllegalStateException("quick model not downloaded")
         val lane = quickLane
-        return withContext(Dispatchers.Default) {
+        LlamaCppBridge.setReleaseWanted(lane.slot, null)
+        return try { withContext(Dispatchers.Default) {
             ensureLoaded(lane, spec)
             lastUseAt = android.os.SystemClock.elapsedRealtime()
             val raw = lane.decodeMutex.withLock {
                 synchronized(LlamaCppBridge.slotMonitor(lane.slot)) { lane.generating = true }
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
                 try {
-                    LlamaCppBridge.nativePredictWords(text, maxWords, lane.slot)
+                    LlamaCppBridge.nativePredictWords(ControlTokens.strip(text), maxWords, lane.slot)
                 } finally {
                     android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DEFAULT)
                     lane.generating = false
@@ -173,15 +199,33 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
                 if (tab <= 0) null
                 else line.substring(0, tab) to (line.substring(tab + 1).toFloatOrNull() ?: 0f)
             }.toList()
+        } } finally {
+            releaseIfWanted(lane, nameOf(lane))
         }
     }
 
     private suspend fun generateOn(
         lane: Lane,
         specParam: ModelSpec,
-        request: GenerateRequest,
+        untrusted: GenerateRequest,
+        onToken: (String) -> Unit
+    ): String {
+        LlamaCppBridge.setReleaseWanted(lane.slot, null)
+        if (lane === draftLane) leap.forgetRelease()
+        return try {
+            generateOnLane(lane, specParam, untrusted, onToken)
+        } finally {
+            releaseIfWanted(lane, nameOf(lane))
+        }
+    }
+
+    private suspend fun generateOnLane(
+        lane: Lane,
+        specParam: ModelSpec,
+        untrusted: GenerateRequest,
         onToken: (String) -> Unit
     ): String = withContext(Dispatchers.Default) {
+        val request = withoutControlTokens(untrusted)
         // LFM-family models run on LEAP (Liquid AI's runtime, with the vendor
         // chat template and manifest sampling baked in). llama.cpp never
         // sees them. Quick lane excluded: autocorrect stays on the tiny
@@ -189,7 +233,10 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
         if (lane.slot == LlamaCppBridge.SLOT_DRAFT && LeapEngine.handles(specParam)) {
             return@withContext generateViaLeap(specParam, request, onToken)
         }
-        val spec = ensureLoaded(lane, specParam)
+        val spec = ensureLoaded(lane, specParam, request.events)
+        // A load cannot be interrupted, so a cancel during one only shows here.
+        // Going on would start a whole generation nobody is waiting for.
+        ensureActive()
         lastUseAt = android.os.SystemClock.elapsedRealtime()
         // PROFILE runs (style distillation) keep their FULL context — it IS
         // the sample being analyzed; the message-shaped fit/sanitize passes
@@ -211,6 +258,7 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
         // the style notes). Short budget keeps them on task.
         val fitted = if (isTiny(spec) &&
             fittedBase.purpose != GenerateRequest.Purpose.PROFILE &&
+            fittedBase.rewriteSource == null &&
             fittedBase.maxWords > 30
         ) fittedBase.copy(maxWords = 30) else fittedBase
         // maxWords doesn't feed the prompt text, so the fitted parts stay
@@ -220,12 +268,13 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
         // P5: dump the verbatim prompt for the Test Lab viewer (RAM-only).
         AiDiagLog.recordPrompt(
             if (fitted.purpose == GenerateRequest.Purpose.PROFILE) "profile" else "draft",
-            parts.static + parts.dynamic
+            parts.static + parts.dynamic,
+            keep = !request.doNotRecordPrompt
         )
         // PROFILE runs (distillation) get a bigger token budget: a full
         // personality profile needs ~150 tokens; capping at 120 cut it off
         // mid-thought, which read as "a very short response".
-        val tokenCap = if (fitted.purpose == GenerateRequest.Purpose.PROFILE) 192 else 120
+        val tokenCap = outputCap(fitted)
         // The 48-token floor belongs to the DRAFT lane. The quick lane's
         // autocorrect prompt asks for ONE word (maxWords=3) — if the tiny
         // model doesn't emit EOG promptly, a 48 floor burns up to 48 decode
@@ -236,21 +285,30 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
         var raw = ""
         var st = LongArray(0)
         var attempt = 0
+        // The native side hands over the whole text so far with every token,
+        // and listeners were promised successive chunks.
+        val stream = DeltaStream(onToken)
+        val priority = decodePriorityFor(fitted)
+        if (lane.decodeMutex.isLocked) request.events?.onStage(GenerateStage.WAITING)
         lane.decodeMutex.withLock {
+        // The wait for an earlier run can be long, and nobody may want this one any more.
+        ensureActive()
         // Set under the slot monitor so no OTHER provider instance can pass
         // its release check and free the slot between here and decode start.
         synchronized(LlamaCppBridge.slotMonitor(lane.slot)) { lane.generating = true }
-        // Decode at background priority, same rule as model load: a burst of
-        // ggml worker threads must never compete with typing.
-        android.os.Process.setThreadPriority(
-            android.os.Process.THREAD_PRIORITY_BACKGROUND
-        )
+        if (lane === draftLane) draftDecodingHere = true
+        // A burst of ggml worker threads must never compete with typing, except
+        // perhaps while someone is looking at the bar waiting for this run:
+        // see decodePriorityFor.
+        android.os.Process.setThreadPriority(priority)
         // Stochastic sampling can deal an instant-EOG or an echo draw
         // (offline: same prompt, seed A parrots, seed B is perfect). One
         // re-draw with a fresh seed recovers most of those for free.
         try {
             while (true) {
                 attempt++
+                ensureActive()
+                request.events?.onStage(GenerateStage.READING)
                 raw = LlamaCppBridge.nativeGenerate(
                     parts.static,
                     parts.dynamic,
@@ -263,47 +321,47 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
                     presencePen = samp.presencePen,
                     freqPen = samp.freqPen,
                     slot = lane.slot
-                ) { piece -> if (attempt == 1) onToken(piece) }
+                ) { full ->
+                    if (!isActive) {
+                        // Native clears its cancel flag on entry, so a cancel that landed
+                        // just before the run started was lost. Raise it again here.
+                        LlamaCppBridge.nativeCancel()
+                    } else {
+                        request.events?.onStage(GenerateStage.WRITING)
+                        if (attempt == 1) stream.onCumulative(full)
+                    }
+                }
                 st = try { LlamaCppBridge.nativeLastStats() } catch (t: Throwable) { LongArray(0) }
-                if (raw.isNotBlank() || attempt >= 2 ||
+                // A cancel during prompt decode comes back blank with finish code 2.
+                // That is not a bad draw: another run would hold the engine for nothing.
+                if (st.getOrElse(5) { -1L }.toInt() == FINISH_CANCELLED || !isActive ||
+                    raw.isNotBlank() || attempt >= 2 ||
                     fitted.purpose == GenerateRequest.Purpose.PROFILE) break
             }
         } finally {
             android.os.Process.setThreadPriority(
                 android.os.Process.THREAD_PRIORITY_DEFAULT
             )
+            if (lane === draftLane) draftDecodingHere = false
             lane.generating = false
         }
         }
-        val stripped = stripEcho(raw, fitted.contextBefore)
-        var note = if (attempt > 1) "redraw ×$attempt" else ""
-        val result: String = if (fitted.purpose == GenerateRequest.Purpose.PROFILE) {
-            cleanProfileOutput(stripped, request.instruction)
-        } else {
-            // The model's favorite failure mode is echoing the conversation
-            // back before/instead of drafting — cut any verbatim echo off
-            // the front, then anything that is prompt scaffolding leaking
-            // THROUGH, any fake next turn, and any run-on past the reply.
-            val out = sanitizeOutput(stripped, fitted.maxWords)
-            // Whole-body echo: tiny models often answer by regurgitating a
-            // slice of the user's own recent typing or screen text verbatim.
-            // Reject it (the caller retries with a different prompt shape).
-            val echo = isEchoOf(out, fitted.contextBefore)
-            // CROSS-CHAT LEAK GUARD. The prompt shows real messages from the
-            // user's OTHER conversations as voice examples. Screen text from
-            // the current app is attacker-controlled — whoever is messaging
-            // you writes it — so "repeat the examples above" is a live path
-            // from a hostile message to another chat's content sitting in the
-            // compose box. Never emit a draft that reproduces one.
-            val leak = !echo && leaksVoiceExample(out, fitted.voiceExamples)
-            if (echo || leak) {
-                if (raw.isNotBlank()) note = if (leak) "voice leak rejected" else "echo rejected"
-                ""
-            } else {
-                if (raw.isNotBlank() && out.isBlank()) note = "sanitized to empty"
-                out
-            }
+        val finish = st.getOrElse(5) { -1L }.toInt()
+        val stopped = finish == FINISH_CANCELLED || !isActive
+        request.events?.onFinished(finish)
+        var note = when {
+            stopped -> "stopped, no retry"
+            attempt > 1 -> "redraw ×$attempt"
+            else -> ""
         }
+        val result: String = when {
+            fitted.purpose == GenerateRequest.Purpose.PROFILE ->
+                cleanProfileOutput(OutputSanitizer.stripEcho(raw, fitted.contextBefore), request.instruction)
+            // What a stopped run got as far as is not a draft.
+            stopped -> ""
+            else -> reviewed(raw, fitted) { note = it }
+        }
+        if (fitted.userWaiting) note = (if (note.isEmpty()) "" else "$note · ") + "nice $priority"
         if (lane.slot == LlamaCppBridge.SLOT_QUICK) {
             // The quick lane runs dozens of times per paragraph — per-run
             // entries would drown every draft in the log. Rolling counters
@@ -342,60 +400,71 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
         onToken: (String) -> Unit
     ): String {
         val path = ModelRegistry.modelFile(context, spec).absolutePath
-        try {
-            leap.ensureLoaded(path, effectiveCtx(spec), draftLane.threads)
-        } catch (t: Throwable) {
-            AiDiagLog.lastLoadEvent =
-                "${spec.displayName}: LEAP LOAD FAILED — ${t.message?.take(90)}"
-            throw t
-        }
-        lastUseAt = android.os.SystemClock.elapsedRealtime()
         val fitted = if (request.purpose == GenerateRequest.Purpose.PROFILE)
             fitProfile(request, spec) else fitToCtx(request, spec).first
         val sys = systemBlock(fitted, isTiny(spec))
         val user = userStaticBlock(fitted) + userDynamicBlock(fitted, spec)
-        // P5: dump the verbatim prompt for the Test Lab viewer (RAM-only).
-        AiDiagLog.recordPrompt(
-            if (fitted.purpose == GenerateRequest.Purpose.PROFILE) "profile" else "draft",
-            "$sys\n$user"
-        )
-        val tokenCap = if (fitted.purpose == GenerateRequest.Purpose.PROFILE) 192 else 120
-        val res = try {
-            leap.generate(
-                sys, user,
-                maxTokens = (fitted.maxWords * 3).coerceIn(48, tokenCap),
-                onToken = onToken
+        val tokenCap = outputCap(fitted)
+        val maxTokens = (fitted.maxWords * 3).coerceIn(48, tokenCap)
+        // Load and generate as one turn, so no other run, of this provider instance or
+        // another, can start on the model or unload it in between.
+        if (leap.lock.isLocked) request.events?.onStage(GenerateStage.WAITING)
+        val res = leap.lock.withLock {
+            // The wait for an earlier run can be long, and nobody may want this one any more.
+            currentCoroutineContext().ensureActive()
+            if (!leap.isLoaded(path)) request.events?.onStage(GenerateStage.LOADING)
+            try {
+                leap.ensureLoaded(path, effectiveCtx(spec), draftLane.threads)
+            } catch (t: Throwable) {
+                if (t is kotlinx.coroutines.CancellationException) throw t
+                AiDiagLog.lastLoadEvent =
+                    "${spec.displayName}: LEAP LOAD FAILED — ${t.message?.take(90)}"
+                ModelRegistry.noteLoadFailed(context, spec)
+                throw ModelLoadException(spec.displayName)
+            }
+            ModelRegistry.noteLoadOk(spec)
+            currentCoroutineContext().ensureActive()
+            lastUseAt = android.os.SystemClock.elapsedRealtime()
+            // P5: dump the verbatim prompt for the Test Lab viewer (RAM-only).
+            AiDiagLog.recordPrompt(
+                if (fitted.purpose == GenerateRequest.Purpose.PROFILE) "profile" else "draft",
+                "$sys\n$user",
+                keep = !request.doNotRecordPrompt
             )
-        } catch (t: Throwable) {
-            AiDiagLog.add(
-                AiDiagLog.Entry(
-                    at = System.currentTimeMillis(), model = spec.displayName,
-                    purpose = if (fitted.purpose == GenerateRequest.Purpose.PROFILE)
-                        "profile" else "draft",
-                    promptTokens = 0, reusedTokens = 0, promptMs = 0,
-                    genTokens = 0, genMs = 0, finish = -1,
-                    note = "leap: ${t.message?.take(80)}"
+            request.events?.onStage(GenerateStage.READING)
+            try {
+                leap.generate(
+                    sys, user,
+                    maxTokens = maxTokens,
+                    onToken = { piece ->
+                        request.events?.onStage(GenerateStage.WRITING)
+                        onToken(piece)
+                    }
                 )
-            )
-            throw t
+            } catch (t: Throwable) {
+                AiDiagLog.add(
+                    AiDiagLog.Entry(
+                        at = System.currentTimeMillis(), model = spec.displayName,
+                        purpose = if (fitted.purpose == GenerateRequest.Purpose.PROFILE)
+                            "profile" else "draft",
+                        promptTokens = 0, reusedTokens = 0, promptMs = 0,
+                        genTokens = 0, genMs = 0, finish = -1,
+                        note = "leap: ${t.message?.take(80)}"
+                    )
+                )
+                throw t
+            }
         }
         val raw = res.text
         val st = res.stats
-        val stripped = stripEcho(raw, fitted.contextBefore)
+        // LEAP has no finish codes, so running out of tokens is read off its count.
+        val finish = if ((st?.completionTokens ?: 0L) >= maxTokens) FINISH_TOKEN_CAP else FINISH_OK
+        request.events?.onFinished(finish)
         var note = "leap"
         val result: String = if (fitted.purpose == GenerateRequest.Purpose.PROFILE) {
-            cleanProfileOutput(stripped, request.instruction)
+            cleanProfileOutput(OutputSanitizer.stripEcho(raw, fitted.contextBefore), request.instruction)
         } else {
-            val out = sanitizeOutput(stripped, fitted.maxWords)
-            val leapLeak = leaksVoiceExample(out, fitted.voiceExamples)
-            if (isEchoOf(out, fitted.contextBefore) || leapLeak) {
-                if (raw.isNotBlank())
-                    note = if (leapLeak) "leap · voice leak rejected" else "leap · echo rejected"
-                ""
-            } else {
-                if (raw.isNotBlank() && out.isBlank()) note = "leap · sanitized to empty"
-                out
-            }
+            reviewed(raw, fitted) { note = "leap · $it" }
         }
         AiDiagLog.add(
             AiDiagLog.Entry(
@@ -408,10 +477,10 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
                 },
                 promptTokens = st?.promptTokens ?: 0L,
                 reusedTokens = st?.cachedPromptTokens ?: 0L,
-                promptMs = 0L,
+                promptMs = res.readingMs,
                 genTokens = st?.completionTokens ?: 0L,
-                genMs = res.wallMs,
-                finish = 0,
+                genMs = res.wallMs - res.readingMs,
+                finish = finish,
                 note = note
             )
         )
@@ -425,7 +494,7 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
     /** Phrases that are vanishingly rare in real chat and characteristic of
      *  someone trying to talk to the model instead of to the owner. This is
      *  defence in depth, NOT the defence: the fence around the chat block and
-     *  the [leaksVoiceExample] output check are what actually hold. A pattern
+     *  the output check in [OutputSanitizer] are what actually hold. A pattern
      *  list can always be reworded around — it just raises the floor. */
     private val INJECTION_RE = Regex(
         "(?i)\\b(" +
@@ -450,45 +519,66 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
             .replace(INJECTION_RE, "[…]")
     }
 
-    /** True when [out] reproduces a chunk of one of the owner's messages from
-     *  ANOTHER conversation. Those are in the prompt as style examples; they
-     *  are private content from elsewhere and must never be emitted verbatim.
+    /**
+     * The draft this run may hand back, or "" with the reason passed on and noted.
      *
-     *  Deliberately stricter than [isEchoOf]: a voice example is short (6..90
-     *  chars), so a 5-word run in common is already most of one. Normalised on
-     *  words so punctuation and casing cannot slip a leak through. */
-    private fun leaksVoiceExample(out: String, examples: List<String>?): Boolean {
-        if (out.isBlank() || examples.isNullOrEmpty()) return false
-        fun words(s: String) = s.lowercase()
-            .split(Regex("[^\\p{L}\\p{N}']+")).filter { it.isNotBlank() }
-        val o = words(out)
-        if (o.size < 5) return false
-        val joined = " " + o.joinToString(" ") + " "
-        for (ex in examples) {
-            val e = words(ex)
-            if (e.size < 5) continue
-            for (i in 0..e.size - 5) {
-                if (joined.contains(" " + e.subList(i, i + 5).joinToString(" ") + " ")) return true
+     * The model's favorite failure is echoing the conversation back before or instead of
+     * drafting, then prompt scaffolding leaking through, fake next turns, and run-ons past
+     * the reply. It can also reproduce a voice example, and those are real messages from
+     * the owner's OTHER chats. Screen text is written by whoever is messaging you, so
+     * "repeat the examples above" is a live path from a hostile message to another chat's
+     * content sitting in the compose box. [OutputSanitizer] refuses all of it.
+     */
+    private fun reviewed(raw: String, fitted: GenerateRequest, note: (String) -> Unit): String =
+        when (val verdict = fitted.review(raw)) {
+            is OutputSanitizer.Accepted -> verdict.text
+            is OutputSanitizer.Rejected -> {
+                when (verdict.reason) {
+                    OutputSanitizer.Reason.VOICE_LEAK -> note("voice leak rejected")
+                    OutputSanitizer.Reason.ECHO -> note("echo rejected")
+                    OutputSanitizer.Reason.SCAFFOLDING -> note("sanitized to empty")
+                    OutputSanitizer.Reason.EMPTY -> Unit
+                }
+                fitted.events?.onRejected(verdict)
+                ""
             }
         }
-        return false
+
+    /**
+     * The native side tokenizes whole prompts with special-token parsing on, so a chat message
+     * holding "<|im_end|><|im_start|>system" would become real role switches the moment the
+     * owner taps draft. Everything in the request that this app did not write goes through
+     * here once, so no part of the prompt can forget to.
+     */
+    private fun withoutControlTokens(r: GenerateRequest): GenerateRequest = r.copy(
+        contextBefore = ControlTokens.strip(r.contextBefore),
+        contextAfter = r.contextAfter?.let(ControlTokens::strip),
+        appTone = r.appTone?.let(ControlTokens::stripLine),
+        styleInstructions = r.styleInstructions?.let(ControlTokens::strip),
+        instruction = r.instruction?.let(ControlTokens::strip),
+        personalityNotes = r.personalityNotes?.let(ControlTokens::strip),
+        personaNotes = r.personaNotes?.let(ControlTokens::strip),
+        voiceExamples = r.voiceExamples?.map(ControlTokens::stripLine),
+        rewriteSource = r.rewriteSource?.let(ControlTokens::strip)
+    )
+
+    /** Longest output a request may ask for. A rewrite has to fit everything its source says,
+     *  and one that hits this is refused by the keyboard rather than cut short. */
+    private fun outputCap(r: GenerateRequest): Int = when {
+        r.purpose == GenerateRequest.Purpose.PROFILE -> 192
+        r.rewriteSource != null -> REWRITE_TOKEN_CAP
+        else -> 120
     }
 
-    private fun isEchoOf(out: String, context: String): Boolean {
-        if (out.length < 18 || context.isEmpty()) return false
-        val low = out.lowercase()
-        val ctx = " ${context.lowercase()} "
-        if (low.length >= 24 && ctx.contains(low)) return true
-        val words = low.split(Regex("\\s+")).filter { it.isNotBlank() }
-        if (words.size < 5) return false
-        var hits = 0
-        var total = 0
-        for (i in 0..words.size - 4) {
-            total++
-            if (ctx.contains(words.subList(i, i + 4).joinToString(" "))) hits++
-        }
-        return total > 0 && hits * 2 >= total
-    }
+    /**
+     * Background priority is the rule for everything else on this lane: ggml's workers must
+     * not fight the keys. Whether that also holds while someone is staring at the bar waiting,
+     * which is when nobody is typing, has to be measured on the phone. So drafts take turns,
+     * and each log entry in AI diagnostics says which priority it ran at next to its tok/s.
+     */
+    private fun decodePriorityFor(r: GenerateRequest): Int =
+        if (r.userWaiting && priorityTurn.getAndIncrement() % 2 == 0) USER_WAITING_PRIORITY
+        else android.os.Process.THREAD_PRIORITY_BACKGROUND
 
     /** Profile-prompt fitting: the sample stays as intact as the context
      *  window allows — only the front (oldest messages) is dropped when
@@ -566,61 +656,10 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
             out = out.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
         // Wholesale instruction parroting: reject (the caller treats blank
         // as a failed distillation and says so, instead of saving garbage).
-        if (instruction != null && out.length >= 18 && isEchoOf(out, instruction)) return ""
+        if (instruction != null && out.length >= 18 && OutputSanitizer.isEchoOf(out, instruction)) return ""
         // Content-free stubs aren't a profile.
         if (out.split(Regex("\\s+")).count { it.length > 2 } < 6) return ""
         return out
-    }
-
-    /** Tiny models sometimes continue the PROMPT instead of answering, or
-     *  answer and then keep going — fake next turns, quoted conversation,
-     *  prompt scaffolding, run-on ramble. Cut ALL of it:
-     *  1. template/scaffolding markers (LEAK_MARKERS) — cut at first hit,
-     *     position 0 means there was no real answer at all ("");
-     *  2. a new line opening a fake turn ("User:", "Them:", "Assistant:")
-     *     — the reply is whatever came before it;
-     *  3. anything past ~1.6x the word budget — trimmed at a sentence
-     *     boundary so the reply still reads complete. */
-    private fun sanitizeOutput(raw: String, maxWords: Int): String {
-        if (raw.isEmpty()) return raw
-        var raw2 = raw
-        // Shape-lock cleanup: the prompt ends with "You:" to anchor the
-        // completion, and models sometimes re-emit the owner label anyway
-        // ("you: yeah, want to come"). Strip a leading owner label — it is
-        // deterministic scaffolding, never message content.
-        val label = OWNER_LABEL.find(raw2)
-        if (label != null && label.range.first == 0) {
-            raw2 = raw2.substring(label.range.last + 1).trimStart()
-            if (raw2.isEmpty()) return ""
-        }
-        val lower = raw2.lowercase()
-        if (lower.startsWith("system\n") || lower.startsWith("assistant\n") ||
-            lower.startsWith("user\n")
-        ) return ""
-        var cut = raw2.length
-        for (marker in LEAK_MARKERS) {
-            val i = lower.indexOf(marker)
-            if (i in 0 until cut) cut = i
-        }
-        var out = raw2.substring(0, cut).replace("\r", "")
-        val turn = FAKE_TURN.find(out)
-        if (turn != null) {
-            if (turn.range.first == 0) return ""
-            out = out.substring(0, turn.range.first)
-        }
-        out = out.trim()
-        // Run-on ramble cap: tiny models sometimes answer well in sentence
-        // one and then drift. Keep the reply inside its word budget, cut at
-        // the last sentence end that fits.
-        val words = out.split(Regex("\\s+")).filter { it.isNotBlank() }
-        val budget = (maxWords * 1.6f).toInt().coerceAtLeast(12)
-        if (words.size > budget) {
-            val hardCap = words.take(budget).joinToString(" ")
-            val lastEnd = hardCap.indexOfLast { it == '.' || it == '!' || it == '?' }
-            out = if (lastEnd >= hardCap.length / 2) hardCap.substring(0, lastEnd + 1)
-                  else hardCap
-        }
-        return out.trim()
     }
 
     /** Never let the prompt exceed the context window: an over-long prompt
@@ -634,7 +673,7 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
      *  winner's parts are reused for generation — the old shape rebuilt the
      *  whole string up to ~9x to measure, then built it AGAIN in generateOn. */
     private fun fitToCtx(request: GenerateRequest, spec: ModelSpec): Pair<GenerateRequest, PromptParts> {
-        val maxTok = (request.maxWords * 3).coerceIn(48, 120)
+        val maxTok = (request.maxWords * 3).coerceIn(48, outputCap(request))
         val budgetChars = ((effectiveCtx(spec) - maxTok - 48) * 3.2f).toInt().coerceAtLeast(400)
         fun fits(p: PromptParts) = p.static.length + p.dynamic.length <= budgetChars
         val parts = buildPromptParts(request, spec)
@@ -671,29 +710,29 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
             if (fits(p)) return r to p
         }
         val empty = noProfile.copy(contextBefore = "", contextAfter = null)
-        return empty to buildPromptParts(empty, spec)
-    }
-
-    /** Drops the longest prefix of [out] that verbatim repeats a suffix of
-     *  [context] (the "Lol yea, hold q for 1…" echo failure). */
-    private fun stripEcho(out: String, context: String): String {
-        if (out.isEmpty() || context.isEmpty()) return out
-        val max = minOf(out.length, context.length, 240)
-        var cut = 0
-        var len = max
-        while (len >= 10) {
-            if (context.endsWith(out.substring(0, len))) { cut = len; break }
-            len--
+        val pEmpty = buildPromptParts(empty, spec)
+        // Context can be shed. What the user asked for cannot: sent anyway, the native side
+        // would cut the head off the prompt, and a rewrite would come back covering only
+        // part of a text it is about to replace.
+        if (!fits(pEmpty) && (request.rewriteSource != null || !request.instruction.isNullOrBlank())) {
+            throw PromptTooLongException()
         }
-        return out.drop(cut).trimStart()
+        return empty to pEmpty
     }
 
+    /** Only with this instance's draft in the engine. The native flag stays up until the next
+     *  generation starts, and the next-word predictor stops at it, so raising it with nothing
+     *  to stop would silence that predictor until the next draft. There is one flag for the
+     *  whole process, so with a run of ours in there, a run on the other lane stops too. */
     override fun cancel() {
-        if (draftLane.loadedPath != null || quickLane.loadedPath != null)
-            LlamaCppBridge.nativeCancel()
+        if (draftDecodingHere) LlamaCppBridge.nativeCancel()
     }
 
-    private suspend fun ensureLoaded(lane: Lane, spec: ModelSpec): ModelSpec {
+    private suspend fun ensureLoaded(
+        lane: Lane,
+        spec: ModelSpec,
+        events: GenerateEvents? = null
+    ): ModelSpec {
         val path = ModelRegistry.modelFile(context, spec).absolutePath
         val wantCtx = if (lane.slot == LlamaCppBridge.SLOT_QUICK)
             QUICK_CTX else effectiveCtx(spec)
@@ -705,30 +744,52 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
         lane.mutex.withLock {
             if (lane.loadedPath == path && lane.loadedCtx == wantCtx &&
                 LlamaCppBridge.nativeIsLoaded(lane.slot)) return spec
-            // The multi-second load (and the ggml worker threads it spawns,
-            // which inherit the caller's priority) must NEVER compete with
-            // typing: run the whole load at background priority.
-            val ok = try {
-                android.os.Process.setThreadPriority(
-                    android.os.Process.THREAD_PRIORITY_BACKGROUND
-                )
-                LlamaCppBridge.nativeLoad(path, nThreads = lane.threads, nCtx = wantCtx, slot = lane.slot)
-            } finally {
-                android.os.Process.setThreadPriority(
-                    android.os.Process.THREAD_PRIORITY_DEFAULT
-                )
-            }
-            if (!ok) {
+            // A run that was told to stop can still be inside native, from this provider
+            // instance or another: a prompt decode cannot be interrupted, and Kotlin has
+            // moved on long before it ends. A load starts by freeing the old model, and
+            // native has no guard of its own, so it waits for that decode like any other run.
+            // The decode path takes only this lock, so the order cannot deadlock against it.
+            if (lane.decodeMutex.isLocked) events?.onStage(GenerateStage.WAITING)
+            lane.decodeMutex.withLock {
+                // The wait can be long, nobody may want this load any more, and the run that
+                // held the lock may have loaded this very model.
+                currentCoroutineContext().ensureActive()
+                if (lane.loadedPath == path && lane.loadedCtx == wantCtx &&
+                    LlamaCppBridge.nativeIsLoaded(lane.slot)) return spec
+                events?.onStage(GenerateStage.LOADING)
+                // Marked as running, so a release from another instance skips this slot
+                // rather than freeing it in the middle of the load.
+                synchronized(LlamaCppBridge.slotMonitor(lane.slot)) { lane.generating = true }
+                // The multi-second load (and the ggml worker threads it spawns,
+                // which inherit the caller's priority) must NEVER compete with
+                // typing: run the whole load at background priority.
+                val ok = try {
+                    android.os.Process.setThreadPriority(
+                        android.os.Process.THREAD_PRIORITY_BACKGROUND
+                    )
+                    LlamaCppBridge.nativeLoad(path, nThreads = lane.threads, nCtx = wantCtx, slot = lane.slot)
+                } finally {
+                    android.os.Process.setThreadPriority(
+                        android.os.Process.THREAD_PRIORITY_DEFAULT
+                    )
+                    lane.generating = false
+                }
+                if (!ok) {
+                    AiDiagLog.lastLoadEvent =
+                        "${spec.displayName}: LOAD FAILED (ctx $wantCtx) — file missing/corrupt?"
+                }
+                if (!ok) {
+                    ModelRegistry.noteLoadFailed(context, spec)
+                    throw ModelLoadException(spec.displayName)
+                }
+                ModelRegistry.noteLoadOk(spec)
+                lane.loadedPath = path
+                lane.loadedCtx = wantCtx
                 AiDiagLog.lastLoadEvent =
-                    "${spec.displayName}: LOAD FAILED (ctx $wantCtx) — file missing/corrupt?"
+                    "${spec.displayName}: loaded ok (ctx $wantCtx, threads ${lane.threads}, " +
+                    (if (wantCtx == spec.nCtx) "default window" else "user window") +
+                    (if (lane.slot == LlamaCppBridge.SLOT_QUICK) ", quick lane" else "") + ")"
             }
-            check(ok) { "model load failed" }
-            lane.loadedPath = path
-            lane.loadedCtx = wantCtx
-            AiDiagLog.lastLoadEvent =
-                "${spec.displayName}: loaded ok (ctx $wantCtx, threads ${lane.threads}, " +
-                (if (wantCtx == spec.nCtx) "default window" else "user window") +
-                (if (lane.slot == LlamaCppBridge.SLOT_QUICK) ", quick lane" else "") + ")"
         }
         return spec
     }
@@ -823,9 +884,9 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
                 if (style.capitalizationStyle == 1) append(", writes in lowercase")
                 if (style.usesContractions) append(", uses contractions")
                 if (style.topWords.isNotEmpty())
-                    append(", favorite words: ${style.topWords.take(6).joinToString { it.first }}")
+                    append(", favorite words: ${ControlTokens.stripLine(style.topWords.take(6).joinToString { it.first })}")
                 if (style.topEmojis.isNotEmpty())
-                    append(", favorite emoji: ${style.topEmojis.take(3).joinToString()}")
+                    append(", favorite emoji: ${ControlTokens.stripLine(style.topEmojis.take(3).joinToString())}")
                 append(".")
             }
         }
@@ -904,7 +965,15 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
                 .takeLastWholeLines(request.contextBefore, contextCap).trim()
         return buildString {
             val instruction = request.instruction?.trim().orEmpty()
-            if (instruction.isNotEmpty()) {
+            val source = request.rewriteSource
+            if (source != null) {
+                append("Do this: ").append(instruction)
+                append(" Output only the rewritten message, nothing else.\n\n")
+                append("The message:\n").append(source).append("\n\n")
+                if (context.isNotEmpty()) {
+                    append("Background (never quote it):\n").append(context).append('\n')
+                }
+            } else if (instruction.isNotEmpty()) {
                 if (request.purpose == GenerateRequest.Purpose.PROFILE && context.isNotEmpty()) {
                     // Tiny models follow the LAST thing they read: material
                     // first, task second — otherwise they parrot the task
@@ -914,7 +983,7 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
                     append("Background (never quote it):\n").append(context).append("\n\n")
                     append("Do this: ").append(instruction).append('\n')
                 } else {
-                    append("Do this: ").append(instruction.take(200)).append("\n\n")
+                    append("Do this: ").append(instruction).append("\n\n")
                     if (context.isNotEmpty()) {
                         append("Background (never quote it):\n").append(context).append('\n')
                     }
@@ -1011,43 +1080,16 @@ class LlamaCppProvider(private val context: Context) : LLMProvider {
          *  ~100–200 tokens. A small window keeps its KV cache tiny. */
         private const val QUICK_CTX = 768
 
-        /** Text that only ever appears in OUR prompt, never in a real reply;
-         *  seeing it in the output means the model is regurgitating the
-         *  prompt. All lowercase; matched case-insensitively. */
-        private val LEAK_MARKERS = listOf(
-            "<|im_start|>", "<|im_end|>", "<|start_header_id|>", "<|end_header_id|>",
-            "<|eot_id|>", "<|begin_of_text|>", "<start_of_turn>", "<end_of_turn>",
-            "<|system|>", "<|user|>", "<|assistant|>", "</s>", "<s>",
-            "<think>", "</think>",
-            "### instruction:", "### response:", "### input:",
-            "rules: output only", "never repeat, quote", "ghostwrite",
-            "my next message:", "now the real one", "two examples of the task",
-            "background (never quote it)", "do this:",
-            // The few-shot block's own labels — the model's favorite thing to
-            // parrot verbatim is example #1 ("Conversation: \"you still
-            // coming over tonight?\""). A real reply never opens with these.
-            "conversation:", "(a new chat)",
-            // The labeled context sections the keyboard prepends — a reply
-            // that opens with a label is parroting, not drafting.
-            "chat on my screen:", "messages i sent recently:", "my next message",
-            "owner's voice from other chats",
-            "my recent messages in this chat",
-            // The 1.6.1 chat-shaped few-shot block's scaffolding.
-            "here is how the job looks", "now this chat:",
-            "write the owner's next reply", "maya: yo did you", "sam: running late"
-        )
+        /** Room for about 170 words: what the keyboard allows a rewrite to come to. */
+        private const val REWRITE_TOKEN_CAP = 512
 
-        /** A new line that opens a FAKE turn ("User:", "Them:", "Assistant:")
-         *  — models that don't stop at the end of the reply invent the other
-         *  side's next message. The real reply is whatever came before. */
-        private val FAKE_TURN =
-            Regex("(?im)^[ \\t]*(user|assistant|system|them|friend|me|you)\\s*:\\s")
+        /** Native finish codes, as named by [AiDiagLog.finishLabel]. */
+        private const val FINISH_OK = 0
+        private const val FINISH_TOKEN_CAP = 1
+        private const val FINISH_CANCELLED = 2
 
-        /** A leading owner label on the WHOLE output ("you: yeah, i'm in") —
-         *  the prompt ends with a "You:" anchor to shape-lock the completion;
-         *  when the model re-emits the label, strip it instead of rejecting
-         *  the whole draft (FAKE_TURN would nuke it as position 0). */
-        private val OWNER_LABEL =
-            Regex("(?i)^[ \\t]*(you|owner)\\s*:\\s+")
+        /** Nice value for a draft someone is waiting on, on its turn. */
+        private const val USER_WAITING_PRIORITY = 5
+        private val priorityTurn = java.util.concurrent.atomic.AtomicInteger()
     }
 }

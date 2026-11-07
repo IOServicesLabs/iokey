@@ -24,6 +24,10 @@ class ProviderRegistry(
 
     fun register(provider: LLMProvider) {
         providers[provider.providerId] = provider
+        // The first availability check is what adopts old model files and runs the
+        // one-time active-model repair. Asked here, off the main thread, both are done
+        // before the first tap on the sparkle reads the answer.
+        if (provider !is LocalStyleComposer) ModelRegistry.offMain { provider.isAvailable }
     }
 
     fun all(): List<LLMProvider> = providers.values.toList()

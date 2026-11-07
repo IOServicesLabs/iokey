@@ -23,7 +23,7 @@ minSdk 31 · targetSdk 36 · arm64-v8a
 | Autocorrect | 114k-word dictionary in a char trie, trie-guided Damerau-Levenshtein search weighted by real key adjacency, ranked with a bundled 176k-entry English bigram model and blended with a personal unigram/bigram/trigram model. Splits run-on words when the space bar is missed |
 | Next word | Bundled bigram model plus the user's own n-grams; optional on-device LLM predictions from the whole message (quick model, incremental KV cache, well under 150 ms per word) |
 | Glide typing | Two-stage decoder: cheap order-aware letter fit and language prior over every candidate, reverse chamfer on the survivors. Dwell detection for doubled letters, per-user gesture bias, alternates held on the bar for one-tap correction |
-| Fit to your hands | A calibration test measures where your fingers actually land and **moves the keys** to match, redistributing key boundaries so the row stays exactly tiled |
+| Keys that stay put | Keys are drawn in the same place every time, and nothing learned about your typing can move them. Every point of the keyboard belongs to exactly one key, including the margins beside the outer keys |
 | Key customiser | Presets plus per-key switches with a live preview; every key you remove hands its width to the space bar |
 | On-device LLM | llama.cpp and Liquid AI LEAP backends, GGUF models, streaming drafts that imitate your own writing. Hold the ✨ to instruct it directly |
 | Voice | Offline transcription via whisper.cpp; audio never leaves the device |

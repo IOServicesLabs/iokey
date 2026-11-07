@@ -11,23 +11,24 @@ interface NGramDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertAll(items: List<NGramEntity>)
 
-    @Query(
-        "UPDATE ngrams SET count = count + :delta, lastUsed = :ts " +
-            "WHERE prev1 = :prev1 AND prev2 = :prev2 AND word = :word"
-    )
+    @Query(NGramSql.INCREMENT)
     suspend fun increment(prev1: String, prev2: String, word: String, delta: Int, ts: Long): Int
 
-    @Query("SELECT * FROM ngrams WHERE prev1 = '' AND prev2 = '' ORDER BY count DESC LIMIT :limit")
+    @Query(NGramSql.TOP_UNIGRAMS)
     suspend fun topUnigrams(limit: Int): List<NGramEntity>
 
-    @Query("SELECT * FROM ngrams WHERE prev2 = '' ORDER BY count DESC LIMIT :limit")
+    @Query(NGramSql.TOP_BIGRAMS)
     suspend fun topBigrams(limit: Int): List<NGramEntity>
 
-    @Query("SELECT * FROM ngrams WHERE prev2 != '' ORDER BY count DESC LIMIT :limit")
+    @Query(NGramSql.TOP_TRIGRAMS)
     suspend fun topTrigrams(limit: Int): List<NGramEntity>
 
     @Query("SELECT COUNT(*) FROM ngrams")
     suspend fun count(): Int
+
+    /** How many different words are learned. [count] is rows, which is several per word. */
+    @Query(NGramSql.WORD_COUNT)
+    suspend fun wordCount(): Int
 
     @Query("SELECT SUM(count) FROM ngrams WHERE prev1 = '' AND prev2 = ''")
     suspend fun totalWordTokens(): Long?
@@ -36,14 +37,17 @@ interface NGramDao {
     suspend fun clear()
 
     /** Delete every n-gram that ends in [word] (unigram, bigrams, trigrams). */
-    @Query("DELETE FROM ngrams WHERE word = :word")
+    @Query(NGramSql.DELETE_WORD)
     suspend fun deleteWord(word: String)
 
-    /** Delete only [word]'s unigram row — strike-1 typo demotion drops the
-     *  bare count so the demotion survives a restart, while any bigram/trigram
-     *  context rows stay (the word itself is only benched, not hanged). */
-    @Query("DELETE FROM ngrams WHERE prev1 = '' AND prev2 = '' AND word = :word")
-    suspend fun deleteUnigram(word: String)
+    /** Delete every n-gram that has one of [words] before it. Each call scans the table, since
+     *  nothing indexes prev2 alone, so callers pass words in batches and not one by one. */
+    @Query(NGramSql.DELETE_CONTEXTS)
+    suspend fun deleteContexts(words: List<String>)
+
+    /** Rows that decrements took down to nothing. */
+    @Query(NGramSql.DELETE_SPENT)
+    suspend fun deleteSpent(): Int
 
     /** Dictionary import with MAX semantics: a re-import never lowers an
      *  existing count (unlike upsertAll, which is REPLACE-on-conflict). */
@@ -54,9 +58,36 @@ interface NGramDao {
     )
     suspend fun upsertMax(prev1: String, prev2: String, word: String, count: Int, ts: Long)
 
+    /** Corpus import: adds to what is stored, as the engine adds to what it holds, so that the
+     *  word typed 200 times and found 3 times in a chat export is at 203 after a restart too. */
+    @Query(NGramSql.ADD_COUNT)
+    suspend fun addCount(prev1: String, prev2: String, word: String, delta: Int, ts: Long)
+
     /** Keep the personal model bounded: prune stale, rarely-used entries. */
-    @Query("DELETE FROM ngrams WHERE count <= 1 AND lastUsed < :olderThan")
+    @Query(NGramSql.PRUNE)
     suspend fun prune(olderThan: Long): Int
+}
+
+/**
+ * Writes one flush in the caller's transaction. Deletions first: see [NGramQueue.Batch]. An increment
+ * that finds no row inserts one, a decrement that finds none has nothing to take back from, and a
+ * decrement that empties a row removes it, so the table holds only what the model would load.
+ */
+suspend fun NGramDao.applyBatch(batch: NGramQueue.Batch, now: Long) {
+    for (word in batch.deletions) deleteWord(word)
+    val inserts = ArrayList<NGramEntity>()
+    var tookBack = false
+    for ((key, delta) in batch.increments) {
+        if (delta == 0) continue
+        val updated = increment(key.first, key.second, key.third, delta, now)
+        if (delta < 0) {
+            tookBack = true
+        } else if (updated == 0) {
+            inserts += NGramEntity(key.first, key.second, key.third, delta, now)
+        }
+    }
+    if (inserts.isNotEmpty()) upsertAll(inserts)
+    if (tookBack) deleteSpent()
 }
 
 @Dao
@@ -66,6 +97,9 @@ interface StyleStatDao {
 
     @Query("SELECT * FROM style_stats")
     suspend fun all(): List<StyleStatEntity>
+
+    @Query("SELECT value FROM style_stats WHERE `key` = :key")
+    suspend fun get(key: String): String?
 
     @Query("DELETE FROM style_stats")
     suspend fun clear()

@@ -1,16 +1,20 @@
 package com.localboard.keyboard.settings
 
 import android.Manifest
+import android.app.Activity
 import android.content.pm.PackageManager
 import android.os.Bundle
-import androidx.appcompat.app.AppCompatActivity
 
 /**
  * Transparent trampoline: the keyboard (a service) can't request runtime
  * permissions itself, so tapping the mic without a grant launches this to
  * show the system dialog, then it finishes immediately.
+ *
+ * A plain Activity because the manifest gives it a platform translucent theme.
+ * AppCompatActivity throws on any theme outside Theme.AppCompat, and this runs
+ * in the keyboard's process, so that would take the keyboard down with it.
  */
-class VoicePermissionActivity : AppCompatActivity() {
+class VoicePermissionActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)

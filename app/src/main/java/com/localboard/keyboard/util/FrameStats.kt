@@ -23,7 +23,8 @@ object FrameStats {
     /** Frames whose only reason to exist was the animated background. */
     @JvmField var backgroundFrames: Long = 0
 
-    /** Frames that redrew the whole view rather than one key's dirty rect. */
+    /** Written by the view and no longer shown: Android has ignored invalidate rects
+     *  since API 21, so every frame redraws the whole view whatever this says. */
     @JvmField var fullRedraws: Long = 0
 
     /** Key presses dispatched. */
@@ -50,8 +51,7 @@ object FrameStats {
     fun elapsedMinutes(): Double =
         ((System.currentTimeMillis() - since).coerceAtLeast(1L)) / 60_000.0
 
-    /** The headline number: frames drawn per keystroke. Under ~4 is good;
-     *  40 means every keypress is repainting the entire key grid. */
+    /** The headline number: frames drawn per keystroke. */
     fun framesPerKeystroke(): Double =
         if (keystrokes == 0L) 0.0 else frames.toDouble() / keystrokes
 
@@ -61,9 +61,6 @@ object FrameStats {
         append(String.format(" (%.0f/min)", frames / mins)).append('\n')
         append("  per keystroke: ")
         append(if (keystrokes == 0L) "—" else String.format("%.1f", framesPerKeystroke()))
-        append('\n')
-        append("  full redraws: ").append(fullRedraws)
-        if (frames > 0) append(String.format(" (%.0f%%)", 100.0 * fullRedraws / frames))
         append('\n')
         append("  background-only: ").append(backgroundFrames)
         append(String.format(" (%.0f/min)", backgroundFrames / mins)).append('\n')

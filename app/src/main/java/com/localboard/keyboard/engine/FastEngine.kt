@@ -50,10 +50,10 @@ class FastEngine(private val context: Context) {
     private val trigramByFirst2 =
         java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentHashMap<String, Int>>()
 
-    /** Words whose unigram count is below DICTIONARY_PROMOTION_THRESHOLD —
-     *  the only slice of userUnigram predictCompletion must scan per
-     *  keystroke (promoted words are already reachable through the trie).
-     *  Maintained at every userUnigram mutation site. */
+    /** Every counted word that has not earned a trie entry, whatever its count:
+     *  the only slice of userUnigram predictCompletion must scan per keystroke
+     *  (promoted words are already reachable through the trie). [syncPromotion]
+     *  decides which is which, at every userUnigram mutation site. */
     private val unpromotedWords =
         java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
@@ -93,25 +93,61 @@ class FastEngine(private val context: Context) {
     fun rootNode(): Trie.Node? = if (isReady) trie.root else null
 
     /**
+     * P(next symbol | the letters typed so far in this word), read off the
+     * trie's subtree sums. [out] holds 27 slots: a to z, then "the word ends
+     * here". False means no opinion and [out] must be ignored: the engine is
+     * not ready, or nothing in the dictionary starts with [prefix], so an
+     * out-of-dictionary word stays purely geometric.
+     *
+     * Asked from the touch path while a promotion or a removal may be changing
+     * the same children on another thread. Those writes are too rare to be
+     * worth a lock on every key press, and a single tap losing its prior is
+     * harmless, so a walk that collides with one simply reports no opinion.
+     */
+    fun nextCharPrior(prefix: String, out: FloatArray): Boolean {
+        if (!isReady) return false
+        return try {
+            fillNextCharPrior(prefix.lowercase(), out)
+        } catch (_: ConcurrentModificationException) {
+            false
+        }
+    }
+
+    private fun fillNextCharPrior(prefix: String, out: FloatArray): Boolean {
+        val node = trie.node(prefix) ?: return false
+        if (node.subtree <= 0L) return false
+        out.fill(0f)
+        // Normalised by what was actually read rather than by node.subtree: the
+        // two can disagree for a moment during a concurrent write, and the
+        // result still has to sum to one.
+        var kept = node.frequency
+        for ((c, child) in node.children) {
+            val i = c - 'a'
+            if (i in 0..25) {
+                out[i] = child.subtree.toFloat()
+                kept += child.subtree
+            }
+        }
+        out[26] = node.frequency.toFloat()
+        if (kept <= 0L) return false
+        val scale = 1f / kept.toFloat()
+        for (i in out.indices) out[i] *= scale
+        return true
+    }
+
+    /**
      * Every word the trie knows (base dictionary + injected personal words),
      * with effective frequencies. Used by the swipe decoder's candidate
-     * generator; result is large (~30k) so callers should cache it.
+     * generator. The result is large, about 114k entries, and is a fresh
+     * list each time, so callers should keep only what they need from it.
      */
     fun allWords(): List<Pair<String, Long>> {
         if (!isReady) return emptyList()
-        // collectAll() walks the whole trie and builds ~114k fresh strings.
-        // The swipe table asks for this on every rebuild, so cache it and
-        // invalidate only when the TRIE actually changes — which is far
-        // rarer than a learn (most learns just bump a count).
-        cachedWords?.let { if (cachedWordsVersion == trieVersion) return it }
-        val list = trie.collectAll()
-        cachedWords = list
-        cachedWordsVersion = trieVersion
-        return list
+        // Only a swipe table rebuild asks for this, and that keys on
+        // [trieVersion], so keeping a copy here would hold about 14 MB to
+        // answer a question that is rarely asked twice.
+        return trie.collectAll()
     }
-
-    @Volatile private var cachedWords: List<Pair<String, Long>>? = null
-    @Volatile private var cachedWordsVersion = -1
 
     /** Bumped only when a word enters or leaves the TRIE (promotion, typo
      *  removal, external import, bulk reload) — not on every count tick.
@@ -200,9 +236,10 @@ class FastEngine(private val context: Context) {
         trigramByFirst2.clear()
         unpromotedWords.clear()
         emailTokens.clear()
+        undoPromotions()
         unigrams.forEach { (w, c) ->
             userUnigram[w] = c
-            if (c < DICTIONARY_PROMOTION_THRESHOLD) unpromotedWords.add(w)
+            syncPromotion(w)
             if (isEmailToken(w)) emailTokens[w] = c
         }
         bigrams.forEach { (p, w, c) ->
@@ -213,7 +250,6 @@ class FastEngine(private val context: Context) {
             userTrigram["${pp.first}|${pp.second}|$w"] = c
             indexTrigram(pp.first, pp.second, w, c, replace = true)
         }
-        unigrams.forEach { (w, _) -> injectPersonal(w) }
         bumpTrie()
         topUnigramDirty = Int.MAX_VALUE
         predictionCache.evictAll()
@@ -243,10 +279,14 @@ class FastEngine(private val context: Context) {
         // confirmation (noteConfirmed) or usage far past the typo band.
         if (w !in confirmedWords && count < STRONG_USAGE_THRESHOLD) return
         val scaled = count.coerceAtMost(50) * 60_000L
-        if (scaled > trie.frequency(w)) {
-            if (trie.frequency(w) == 0L) injectedPersonal.add(w)
+        val current = trie.frequency(w)
+        if (scaled > current) {
+            if (current == 0L) injectedPersonal.add(w)
+            else if (w !in injectedPersonal) raisedFrequencies.putIfAbsent(w, current)
             trie.insert(w, scaled)
-            bumpTrie()
+            // Only a new word changes what can be glided. A raised count does
+            // not, and the personal bonus reads the live count anyway.
+            if (current == 0L) bumpTrie()
         }
     }
 
@@ -254,6 +294,34 @@ class FastEngine(private val context: Context) {
      *  does not contain — the only trie entries [unlearnRecent] may remove. */
     private val injectedPersonal =
         java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** Dictionary words [injectPersonal] ranked higher, with the frequency they shipped at. */
+    private val raisedFrequencies =
+        java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** Takes back everything promotion did to the trie. A reload then promotes only the
+     *  words it still holds, where before a deleted word stayed completable and glidable
+     *  until the process died. */
+    private fun undoPromotions() {
+        for (w in injectedPersonal) trie.remove(w)
+        injectedPersonal.clear()
+        for ((w, shipped) in raisedFrequencies) {
+            trie.remove(w)
+            trie.insert(w, shipped)
+        }
+        raisedFrequencies.clear()
+    }
+
+    /** Everything learned goes from memory, as it does from the store when the user erases.
+     *  Run it on the thread that runs the correction walks: it changes the trie. */
+    fun forgetEverythingLearned() {
+        restoreSuppressions(emptySet())
+        restoreStrikes(emptyMap())
+        restoreConfirmed(emptySet())
+        loadUserModel(emptyList(), emptyList(), emptyList())
+        appVocab.clear()
+        modelVersion++
+    }
 
     /**
      * Undo ONE learned occurrence of [word]: the personal count drops by one
@@ -269,28 +337,82 @@ class FastEngine(private val context: Context) {
      * dictionary and hid it from every suggestion for 30 days. Every
      * corrected glide banished an English word; a heavy glide user lost
      * dozens, which is a large part of why glide "never got it right".
+     *
+     * [prev1] and [prev2] are the words the occurrence was learned after. Pass
+     * them to take back the bigram and trigram [learn] added too, or a wiped
+     * "you flight" goes on recommending "flight" after "you".
+     *
+     * Returns true when this emptied the word out of the personal model, which
+     * is the caller's cue to delete its stored rows as well: a decrement can
+     * only net against a row that stays.
      */
-    fun unlearnRecent(word: String) {
+    fun unlearnRecent(word: String, prev1: String = "", prev2: String = ""): Boolean {
         val w = word.trim().lowercase()
-        if (w.length < 2) return
-        val c = userUnigram[w] ?: return
-        val n = c - 1
-        if (n <= 0) {
-            userUnigram.remove(w)
-            unpromotedWords.remove(w)
-            emailTokens.remove(w)
-            if (injectedPersonal.remove(w)) {
-                trie.remove(w)
-                bumpTrie()
+        if (w.length < 2) return false
+        val c = userUnigram[w]
+        // Counts can be missing a unigram while still holding its context rows,
+        // since those are loaded and capped separately, so the two are undone
+        // independently.
+        if (c == null && prev1.isEmpty()) return false
+        var emptied = false
+        if (c != null) {
+            val n = c - 1
+            if (n <= 0) {
+                userUnigram.remove(w)
+                unpromotedWords.remove(w)
+                emailTokens.remove(w)
+                if (injectedPersonal.remove(w)) {
+                    trie.remove(w)
+                    bumpTrie()
+                }
+                scrubNgrams(w)
+                emptied = true
+            } else {
+                userUnigram[w] = n
+                if (isEmailToken(w)) emailTokens[w] = n
+                syncPromotion(w)
             }
-            scrubNgrams(w)
-        } else {
-            userUnigram[w] = n
-            if (isEmailToken(w)) emailTokens[w] = n
-            if (n < DICTIONARY_PROMOTION_THRESHOLD) unpromotedWords.add(w)
+        }
+        // Emptied means scrubbed: there is no row left for these to decrement.
+        if (!emptied && prev1.isNotEmpty()) {
+            val p1 = prev1.lowercase()
+            decrementBigram(p1, w)
+            if (prev2.isNotEmpty()) decrementTrigram(prev2.lowercase(), p1, w)
         }
         topUnigramDirty = Int.MAX_VALUE
         modelVersion++
+        return emptied
+    }
+
+    private fun decrementBigram(p: String, w: String) {
+        val k = "$p|$w"
+        val n = (userBigram[k] ?: return) - 1
+        if (n <= 0) {
+            userBigram.remove(k)
+            bigramByFirst[p]?.let { m ->
+                m.remove(w)
+                if (m.isEmpty()) bigramByFirst.remove(p, m)
+            }
+        } else {
+            userBigram[k] = n
+            bigramByFirst[p]?.put(w, n)
+        }
+    }
+
+    private fun decrementTrigram(p2: String, p1: String, w: String) {
+        val k = "$p2|$p1|$w"
+        val n = (userTrigram[k] ?: return) - 1
+        val prefix = "$p2|$p1"
+        if (n <= 0) {
+            userTrigram.remove(k)
+            trigramByFirst2[prefix]?.let { m ->
+                m.remove(w)
+                if (m.isEmpty()) trigramByFirst2.remove(prefix, m)
+            }
+        } else {
+            userTrigram[k] = n
+            trigramByFirst2[prefix]?.put(w, n)
+        }
     }
 
     /** Words the user has REJECTED by accepting an autocorrection away from
@@ -311,11 +433,12 @@ class FastEngine(private val context: Context) {
         java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     /** Words the user has EXPLICITLY confirmed as intended vocabulary (via
-     *  [noteConfirmed] — a prediction-bar tap or an undone correction wired
-     *  by the caller). Only these words are immune from autocorrection at
-     *  low counts; a bare repeat count no longer confers immunity, which is
-     *  what let a typo typed 3x become permanently uncorrectable. Persisted
-     *  by ContextEngine alongside the suppression snapshot. */
+     *  [noteConfirmed], which a prediction-bar tap reaches; undoing a
+     *  correction protects the word through RejectionMemory and confirms
+     *  nothing). Only these words are immune from autocorrection at low
+     *  counts; a bare repeat count no longer confers immunity, which is what
+     *  let a typo typed 3x become permanently uncorrectable. Persisted by
+     *  ContextEngine alongside the suppression snapshot. */
     private val confirmedWords =
         java.util.Collections.synchronizedSet(HashSet<String>())
 
@@ -326,7 +449,60 @@ class FastEngine(private val context: Context) {
         if (w.length < 2) return
         confirmedWords.add(w)
         clearStrikes(w)
-        if ((userUnigram[w] ?: 0) >= DICTIONARY_PROMOTION_THRESHOLD) injectPersonal(w)
+        syncPromotion(w)
+    }
+
+    /** The bar tap that confirmed [word] turned out to be a slip: take the
+     *  confirmation back, along with the trie entry it alone was holding up.
+     *  A word confirmed long before this tap must not come here, which only
+     *  the caller can know. */
+    fun unconfirm(word: String) {
+        val w = word.lowercase().trim()
+        if (w.length < 2) return
+        confirmedWords.remove(w)
+        if ((userUnigram[w] ?: 0) < STRONG_USAGE_THRESHOLD && injectedPersonal.remove(w)) {
+            trie.remove(w)
+            bumpTrie()
+            modelVersion++
+        }
+        syncPromotion(w)
+    }
+
+    /** Puts a counted word where it can be found: in the trie once it has earned
+     *  promotion, otherwise in the slice predictCompletion scans. These are the
+     *  same tests [injectPersonal] makes, because a word that passes here and
+     *  fails there is reachable from neither. Reaching the threshold is not
+     *  enough without a confirmation, so words at counts from
+     *  [DICTIONARY_PROMOTION_THRESHOLD] to [STRONG_USAGE_THRESHOLD] stay scanned. */
+    private fun syncPromotion(w: String) {
+        val c = userUnigram[w] ?: return
+        val promoted = w.length >= 3 && '@' !in w &&
+            c >= DICTIONARY_PROMOTION_THRESHOLD &&
+            (w in confirmedWords || c >= STRONG_USAGE_THRESHOLD)
+        if (promoted) {
+            unpromotedWords.remove(w)
+            injectPersonal(w)
+        } else {
+            unpromotedWords.add(w)
+        }
+    }
+
+    fun isConfirmed(word: String): Boolean = word.lowercase().trim() in confirmedWords
+
+    /** True while [word] holds a strike, one accepted correction short of the
+     *  blacklist. */
+    fun hasStrike(word: String): Boolean =
+        synchronized(typoStrikes) { typoStrikes.containsKey(word.lowercase().trim()) }
+
+    /** The user said [word] is not a typo: drop any strike and any blacklist
+     *  entry. Its counts are left alone, so nothing here makes it known. */
+    fun clearTypoVerdict(word: String) {
+        val w = word.lowercase().trim()
+        clearStrikes(w)
+        if (typoSuppressions.remove(w)) {
+            suppressionStamps.remove(w)
+            predictionCache.evictAll()
+        }
     }
 
     fun confirmedWordsSnapshot(): Set<String> =
@@ -338,9 +514,7 @@ class FastEngine(private val context: Context) {
             confirmedWords.clear()
             confirmedWords.addAll(clean)
         }
-        for (w in clean) {
-            if ((userUnigram[w] ?: 0) >= DICTIONARY_PROMOTION_THRESHOLD) injectPersonal(w)
-        }
+        for (w in clean) syncPromotion(w)
     }
 
     fun restoreSuppressions(words: Set<String>) {
@@ -365,8 +539,8 @@ class FastEngine(private val context: Context) {
         modelVersion++
     }
 
-    /** First-strike demotions: word -> (strikes, lastStrikeAt). One accepted
-     *  correction is evidence, not proof — the word is benched, not hanged. */
+    /** First strikes: word -> (strikes, lastStrikeAt). One accepted correction
+     *  is evidence, not proof, so a strike changes nothing else about the word. */
     private val typoStrikes = HashMap<String, Pair<Int, Long>>()
 
     fun strikesSnapshot(): Map<String, String> = HashMap<String, String>().also { out ->
@@ -399,16 +573,19 @@ class FastEngine(private val context: Context) {
         }
 
     /** The user accepted a correction AWAY from [word].
-     *  A5: ONE correction used to blacklist a word forever — and with the old
+     *  ONE correction used to blacklist a word forever — and with the old
      *  transposition-cost error rate, that actively eroded the personal
-     *  dictionary over time. Now: first correction = strike one (dropped from
-     *  the personal model, nothing permanent); a second correction-away of
-     *  the SAME word (without the user reverting/re-adding it in between)
-     *  = confirmed typo (trie removal + blacklist). Everything expires after
-     *  30 days — vocabulary verdicts should not outlive habit changes. */
+     *  dictionary over time. Now: a confirmed word takes no strike at all; a
+     *  first correction = strike one, which is only a note and removes
+     *  nothing; a second correction-away of the SAME word (without the user
+     *  reverting/re-adding it in between) = confirmed typo (out of the
+     *  personal model, blacklisted). A shipped word stays in the dictionary
+     *  even then. Everything expires after 30 days — vocabulary verdicts
+     *  should not outlive habit changes. */
     fun noteTypo(word: String) {
         val w = word.lowercase().trim()
         if (w.length < 2 || w.any { it.isDigit() }) return
+        if (w in confirmedWords) return
         val now = System.currentTimeMillis()
         val strikes: Int
         synchronized(typoStrikes) {
@@ -417,24 +594,33 @@ class FastEngine(private val context: Context) {
                 prev.first else 0) + 1
             typoStrikes[w] = strikes to now
         }
+        // One accepted correction is only a note. It removes nothing.
+        if (strikes < 2) {
+            modelVersion++
+            return
+        }
         userUnigram.remove(w)
         unpromotedWords.remove(w)
         emailTokens.remove(w)
-        // Strike one already demotes the trie entry — a deliberately re-typed
-        // word is restored by injectPersonal on the next learn, so this costs
-        // a deliberate word nothing but immediately stops suggesting a typo
-        // that had reached promotion strength before the verdict arrived.
-        trie.remove(w)
-        bumpTrie()
-        if (strikes >= 2) {
-            // Confirmed typo: scrub it from the n-gram model too, not just
-            // the unigram map — otherwise "prev|typo" entries keep
-            // recommending the very word the user has now rejected twice.
-            scrubNgrams(w)
-            typoSuppressions.add(w)
-            suppressionStamps[w] = now
-            synchronized(typoStrikes) { typoStrikes.remove(w) }
+        // Only what promotion did to the trie goes back: a word it added
+        // leaves, a word it raised returns to the frequency it shipped at. A
+        // shipped word removed here would stay unknown until the process dies.
+        if (injectedPersonal.remove(w)) {
+            trie.remove(w)
+            bumpTrie()
+        } else {
+            raisedFrequencies.remove(w)?.let { shipped ->
+                trie.remove(w)
+                trie.insert(w, shipped)
+            }
         }
+        // Confirmed typo: scrub it from the n-gram model too, not just
+        // the unigram map — otherwise "prev|typo" entries keep
+        // recommending the very word the user has now rejected twice.
+        scrubNgrams(w)
+        typoSuppressions.add(w)
+        suppressionStamps[w] = now
+        synchronized(typoStrikes) { typoStrikes.remove(w) }
         topUnigramDirty = Int.MAX_VALUE
         modelVersion++
     }
@@ -452,8 +638,9 @@ class FastEngine(private val context: Context) {
         trigramByFirst2.entries.removeAll { it.value.isEmpty() }
     }
 
-    /** Explicit intent (prediction-bar tap, undo of a correction) clears all
-     *  strikes — the word was never a typo, the engine was. */
+    /** Explicit intent (a prediction-bar tap, or a correction refused, which
+     *  gets here through [clearTypoVerdict]) clears all strikes — the word was
+     *  never a typo, the engine was. */
     private fun clearStrikes(w: String) {
         synchronized(typoStrikes) { typoStrikes.remove(w) }
     }
@@ -478,11 +665,25 @@ class FastEngine(private val context: Context) {
                 userUnigram[w] = DICTIONARY_PROMOTION_THRESHOLD
                 promoted += w
             }
-            unpromotedWords.remove(w)
-            injectPersonal(w)
+            syncPromotion(w)
         }
         modelVersion++
         return promoted
+    }
+
+    /** Word counts from a backup. The store keeps the higher of its count and the backup's,
+     *  so memory does too: adding here would offer a word now and lose it at the next start,
+     *  and would raise it again with every repeat of the same restore. */
+    fun mergeRestoredCounts(words: List<Pair<String, Int>>) {
+        for ((w, c) in words) {
+            val kept = userUnigram.merge(w, c) { held, restored -> max(held, restored) } ?: c
+            syncPromotion(w)
+            if (isEmailToken(w)) emailTokens[w] = kept
+        }
+        bumpTrie()
+        topUnigramDirty = Int.MAX_VALUE
+        modelVersion++
+        predictionCache.evictAll()
     }
 
     /** Merge a bulk-imported corpus into the existing personal model. */
@@ -493,8 +694,7 @@ class FastEngine(private val context: Context) {
     ) {
         unigrams.forEach { (w, c) ->
             userUnigram.merge(w, c, Int::plus)
-            if ((userUnigram[w] ?: 0) < DICTIONARY_PROMOTION_THRESHOLD)
-                unpromotedWords.add(w) else unpromotedWords.remove(w)
+            syncPromotion(w)
             if (isEmailToken(w)) emailTokens.merge(w, c, Int::plus)
         }
         bigrams.forEach { (p, w, c) ->
@@ -505,7 +705,6 @@ class FastEngine(private val context: Context) {
             userTrigram.merge("${pp.first}|${pp.second}|$w", c, Int::plus)
             indexTrigram(pp.first, pp.second, w, c, replace = false)
         }
-        unigrams.forEach { (w, _) -> injectPersonal(w) }
         bumpTrie()
         predictionCache.evictAll()
     }
@@ -531,16 +730,18 @@ class FastEngine(private val context: Context) {
     /** P2: the user long-pressed this word in the bar and chose Remove —
      *  banish it from every learned structure (trie, unigram, both n-gram
      *  maps and their prefix indexes, every app's vocab) and suppress
-     *  re-suggestion. A base-dictionary entry isn't deleted (it was never
-     *  "learned"), but suppression still hides it from predictions. */
+     *  re-suggestion. A base-dictionary entry leaves the trie as well, until
+     *  the dictionary is next loaded. */
     fun removeWordEverywhere(word: String) {
         val w = word.trim().lowercase()
         if (w.length < 2) return
         userUnigram.remove(w)
         unpromotedWords.remove(w)
         emailTokens.remove(w)
-        trie.remove(w)
-        bumpTrie()
+        if (trie.contains(w)) {
+            trie.remove(w)
+            bumpTrie()
+        }
         scrubNgrams(w)
         for ((pkg, vocab) in appVocab) {
             if (vocab.containsKey(w)) {
@@ -560,6 +761,12 @@ class FastEngine(private val context: Context) {
     /** Personal usage count of a word (0 = never used). */
     fun userFrequency(word: String): Int = userUnigram[word.lowercase()] ?: 0
 
+    /** True when the dictionary has [word], or the user's use of it has promoted it there. */
+    fun isKnownWord(word: String): Boolean {
+        val lower = word.lowercase()
+        return trie.contains(lower) || lower in SHORT_WORDS
+    }
+
     /** Like [userFrequency] for a word the caller has ALREADY lowercased —
      *  hot paths call this per candidate, so no per-call lowercase(). */
     fun userFrequencyLower(w: String): Long = userUnigram[w]?.toLong() ?: 0L
@@ -572,6 +779,15 @@ class FastEngine(private val context: Context) {
      *  lowercase() and no string concatenation. */
     fun hasBigramLower(loweredPrev: String, lowerWord: String): Boolean =
         bigramByFirst[loweredPrev]?.containsKey(lowerWord) == true
+
+    /** Every word this user has typed after [p1], with its count. Null when
+     *  there are none. The decoder fetches this once per gesture instead of
+     *  building a key per candidate, so the argument must ALREADY be lowercase.
+     *  A live view of a concurrent map, safe to read off the main thread. */
+    fun bigramRowLower(p1: String): Map<String, Int>? = bigramByFirst[p1]
+
+    /** As [bigramRowLower], for the words typed after the pair [p2] [p1]. */
+    fun trigramRowLower(p2: String, p1: String): Map<String, Int>? = trigramByFirst2["$p2|$p1"]
 
     /**
      * The missed space bar: "thisis" -> "this is".
@@ -1085,12 +1301,6 @@ class FastEngine(private val context: Context) {
     private fun keyDist(a: Char, b: Char): Double =
         if (a == b) 0.0 else if (NEIGHBORS[a]?.contains(b) == true) 0.5 else 1.0
 
-    /** Public adjacency check — used by correction-driven hand calibration
-     *  ("hit q, meant w": the two keys must be neighbors for the signal to
-     *  be a hand-position issue rather than a real typo). */
-    fun keysAdjacent(a: Char, b: Char): Boolean =
-        a != b && NEIGHBORS[a.lowercaseChar()]?.contains(b.lowercaseChar()) == true
-
     /** Learn one occurrence. Persisting is handled by ContextEngine (batched).
      *  Counts every word for statistics, but only promotes deliberate repeats
      *  into the swipe/correction dictionary (see injectPersonal). [selected]
@@ -1098,15 +1308,17 @@ class FastEngine(private val context: Context) {
      *  worth several sightings. Confirmed typos (suppressed) are never learned. */
     fun isSuppressed(word: String): Boolean = typoSuppressions.contains(word.lowercase())
 
-    fun learn(word: String, prev1: String, prev2: String, selected: Boolean = false) {
-        if (word.length < 2) return
+    /** True when the occurrence counted. A refused one is not in the model, so it has
+     *  no business in the store either. */
+    fun learn(word: String, prev1: String, prev2: String, selected: Boolean = false): Boolean {
+        if (word.length < 2) return false
         val w = word.lowercase()
         // Email-shaped tokens keep their digits ("jane2@…") and may run long;
         // every other token with a digit is still refused outright.
         val emailish = isEmailToken(w)
         if (emailish) {
-            if (w.length > 64) return
-        } else if (w.any { it.isDigit() }) return
+            if (w.length > 64) return false
+        } else if (w.any { it.isDigit() }) return false
         if (typoSuppressions.contains(w)) {
             // Explicit intent overrides an old typo verdict: the user tapping
             // this exact word in the prediction bar (or reverting a correction
@@ -1114,7 +1326,7 @@ class FastEngine(private val context: Context) {
             // the word can finally stick. Without this, a word once
             // corrected-away could never be re-added: every learn bounced off
             // the blacklist and the keyboard kept asking to add it again.
-            if (!selected) return
+            if (!selected) return false
             typoSuppressions.remove(w)
             suppressionStamps.remove(w)
             predictionCache.evictAll()
@@ -1123,9 +1335,7 @@ class FastEngine(private val context: Context) {
         val newCount = (userUnigram[w] ?: 0) + (if (selected) SELECTION_BOOST else 1)
         userUnigram[w] = newCount
         if (emailish) emailTokens[w] = newCount
-        if (newCount < DICTIONARY_PROMOTION_THRESHOLD) unpromotedWords.add(w)
-        else unpromotedWords.remove(w)
-        if (newCount >= DICTIONARY_PROMOTION_THRESHOLD) injectPersonal(w)
+        syncPromotion(w)
         if (prev1.isNotEmpty()) {
             userBigram.merge("${prev1.lowercase()}|$w", 1, Int::plus)
             indexBigram(prev1.lowercase(), w, 1, replace = false)
@@ -1144,6 +1354,7 @@ class FastEngine(private val context: Context) {
         modelVersion++
         if (topUnigramDirty != Int.MAX_VALUE) topUnigramDirty++
         evictPersonalMapsIfNeeded()
+        return true
     }
 
     /** Amortized cap on the personal maps: once a map exceeds its limit, the
@@ -1259,14 +1470,17 @@ class FastEngine(private val context: Context) {
             }
         }
         // A user-coined word that isn't in the base dictionary can still be offered.
-        // Only words BELOW the promotion threshold are scanned — anything at or
-        // above it lives in the trie already and arrives via completions().
+        // Only words that have not been promoted are scanned — the rest live in
+        // the trie already and arrive via completions(). A blacklisted word can
+        // get here only with counts from a restore, and is not offered either way.
         for (word in unpromotedWords) {
             val count = userUnigram[word] ?: continue
             // Emails are served by emailCompletions() in email context only —
             // never as ordinary word completions in arbitrary fields.
             if ('@' in word) continue
-            if (word.startsWith(prefix) && word != prefix && trie.frequency(word) == 0L) {
+            if (word.startsWith(prefix) && word != prefix && trie.frequency(word) == 0L &&
+                !typoSuppressions.contains(word)
+            ) {
                 // ln-scaled like score()'s own unigram term: a raw linear
                 // "+ count" on top of a log-scale score let one much-typed
                 // coinage bury every real completion.
@@ -1611,15 +1825,15 @@ class FastEngine(private val context: Context) {
          *  promotion threshold; everyone else must pass this higher bar,
          *  which a repeated finger-slip typo essentially never reaches
          *  without being corrected away first. */
-        private const val STRONG_USAGE_THRESHOLD = 8
+        const val STRONG_USAGE_THRESHOLD = 8
         /** Caps on the personal maps; on overflow the lowest-count 10% is
          *  evicted (amortized, see evictPersonalMapsIfNeeded). */
-        private const val MAX_PERSONAL_UNIGRAMS = 10_000
-        private const val MAX_PERSONAL_BIGRAMS = 32_000
-        private const val MAX_PERSONAL_TRIGRAMS = 24_000
+        const val MAX_PERSONAL_UNIGRAMS = 10_000
+        const val MAX_PERSONAL_BIGRAMS = 32_000
+        const val MAX_PERSONAL_TRIGRAMS = 24_000
         /** Tapping a word in the prediction bar is explicit "this is my word"
          *  intent — worth an instant promotion on first sight. */
-        private const val SELECTION_BOOST = 4
+        const val SELECTION_BOOST = 4
         /** Score discount for one-adjacent-key completion variants. */
         private const val FAT_FINGER_PENALTY = 1.2
 
@@ -1701,10 +1915,13 @@ class FastEngine(private val context: Context) {
             return map
         }
 
-        /** A3: the ~120 contractions English actually uses, at corpus-realistic
-         *  frequencies (matching the base dictionary's count scale). "don't" is
-         *  genuinely a top-200 word; its absence made the keyboard incapable of
-         *  everyday English. */
+        /** The contractions English actually uses, about 80 of them. The figures are set
+         *  by hand for a chat keyboard, not counted, and they run high against the base
+         *  dictionary, whose corpus is formal: "we'll" is 4.5 times "well" and "he'll" 17
+         *  times "hell". Completions and autocorrect read them as they are. Glide keeps
+         *  its own figures where two spellings share a curve, see SwipeDecoder.Contraction.
+         *  "don't" is genuinely a top-200 word; its absence made the keyboard incapable
+         *  of everyday English. */
         private val CONTRACTIONS: List<Pair<String, Long>> = listOf(
             "don't" to 9_000_000L, "it's" to 9_500_000L, "i'm" to 7_500_000L,
             "that's" to 6_500_000L, "can't" to 5_000_000L, "didn't" to 4_500_000L,

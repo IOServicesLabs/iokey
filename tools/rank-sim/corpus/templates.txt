@@ -1,0 +1,252 @@
+# Invented for this simulator, no real messages. One message per line, {slot}
+# picks an entry from the @slot list. How often a template or an entry comes up
+# depends on the seed, so each seed behaves like a different person.
+@when: tonight|tomorrow|today|later|this weekend|next week|on friday|on saturday|on sunday|on monday|after work|after lunch|this morning|this afternoon
+@clock: one|two|three|four|five|six|seven|eight|nine|ten|eleven|noon
+@mins: five|ten|fifteen|twenty|thirty
+@food: pizza|tacos|sushi|burgers|chinese|thai|wings|pasta|sandwiches|breakfast|coffee|ice cream
+@grocery: milk|eggs|bread|coffee|paper towels|dog food|bananas|ice|butter|cereal|chips
+@place: the store|the gym|work|the office|the airport|the mall|the beach|the park|the bank|the pharmacy|costco|target|the school|church|the library
+@person: my mom|my dad|my sister|my brother|my boss|my roommate|my friend|the kids|your mom|your dad|your sister|the neighbors
+@name: kayla|jaxon|sam|alex|chris|maria|mike|jess|nina|tyler
+@activity: watch a movie|play some games|go for a walk|grab a drink|get some food|hang out|go shopping|go to the gym|see the game|go swimming|clean the house|do laundry|take a nap
+@feeling: tired|hungry|excited|stressed|bored|busy|sick|nervous|happy|annoyed
+@adj: good|great|fun|crazy|weird|funny|expensive|boring|nice|hard|easy
+@thing: the game|that movie|the show|the new place|the meeting|the party|the test|the interview|the trip|the concert|the video|that song
+@chore: take out the trash|feed the dog|pay the bill|wash the car|call the plumber|pick up the kids|do the dishes|charge my phone|send the email|book the tickets
+hey are you free {when}
+are you coming to {place} {when}
+what time are you going to {place}
+i'm at {place} do you need anything
+i'm on my way to {place}
+i just got to {place}
+i'll be at {place} in {mins} minutes
+i'll be there in like {mins} minutes
+give me {mins} more minutes
+can you pick up some {grocery} on your way home
+can you grab some {grocery} from {place}
+do we need {grocery}
+we're out of {grocery}
+don't forget to {chore}
+did you {chore}
+i still need to {chore}
+can you {chore} {when}
+i forgot to {chore}
+i have to {chore} first
+what do you want for dinner
+do you want {food} for dinner
+i'm craving {food}
+let's get {food} {when}
+how about {food}
+{food} sounds good to me
+we should get {food} {when}
+i just had {food}
+do you want to {activity} {when}
+let's {activity} {when}
+i want to {activity}
+we should {activity} sometime
+we could {activity} if you want
+i don't want to {activity} {when}
+i'm going to {activity} with {name}
+are you going to {activity}
+did you see {thing}
+how was {thing}
+{thing} was really {adj}
+{thing} was so {adj}
+i heard {thing} was {adj}
+i can't believe how {adj} {thing} was
+i'm so {feeling} today
+i'm really {feeling} right now
+i feel so {feeling}
+you sound {feeling}
+why are you so {feeling}
+i'm too {feeling} to {activity}
+i was just talking to {person}
+did you talk to {person}
+i have to call {person} back
+{person} wants to come over {when}
+{person} said hi
+{person} is coming over {when}
+how is {person} doing
+tell {person} i said hi
+i saw {name} at {place}
+{name} said she can't make it
+{name} is coming with us
+have you talked to {name}
+did {name} text you back
+i'll text {name} and let you know
+what time does {thing} start
+what time is {thing}
+when is {thing}
+is {thing} still happening
+{thing} starts at {clock}
+let's meet at {clock}
+how about {clock}
+i get off work at {clock}
+i'll pick you up at {clock}
+i'll call you at {clock}
+i have to be up at {clock}
+the kids get out at {clock}
+i'll be home around {clock}
+what time will you be home
+when will you be home
+are you home yet
+are you still at work
+i just got off work
+i'm leaving work now
+i'm stuck at work
+i have to work {when}
+i don't have to work {when}
+i can't make it {when}
+i think i can make it
+i'll let you know {when}
+let me know when you get home
+let me know if you need anything
+let me know what you think
+let me know when you're ready
+let me know if that works
+text me when you get there
+call me when you get a chance
+call me when you're done
+can you call me back
+sorry i missed your call
+sorry i didn't see your text
+sorry i'm running late
+sorry i fell asleep
+sorry about that
+no worries
+no problem
+thank you so much
+thanks for the help
+thanks for letting me know
+thanks for dinner
+i appreciate it
+you're the best
+that's so {adj}
+that's really {adj}
+that was really {adj}
+that sounds {adj}
+that sounds like fun
+sounds good
+sounds good to me
+that works for me
+that doesn't work for me
+i don't think so
+i think so
+i don't know yet
+i don't know what to do
+i don't know what you want
+i don't care
+i don't mind
+i don't feel like it
+i don't have time
+i have no idea
+i have so much to do
+i have a lot going on right now
+i need to talk to you about something
+can we talk later
+can you help me with something
+can i ask you something
+can i call you later
+can you do me a favor
+do you have time to talk
+do you need a ride
+do you need anything from {place}
+do you know where my keys are
+do you know what time it is
+do you want me to come with you
+do you want me to pick you up
+do you want to come with us
+what are you doing {when}
+what are you up to
+what are you doing right now
+what do you mean
+what do you think
+what did you say
+what happened
+what's going on
+what's up
+where are you
+where are you going
+where did you go
+where do you want to go
+where should we go
+who are you going with
+who is coming
+why didn't you tell me
+why are you still up
+how are you
+how are you doing
+how was your day
+how was work
+how much was it
+how long will it take
+how far away are you
+is everything okay
+is it okay if i bring {name}
+it was really {adj}
+it's not that {adj}
+it's okay don't worry about it
+it's so {adj} out
+it's going to be {adj}
+it's on the kitchen counter
+it's in the car
+it's at {clock}
+i love you
+love you too
+miss you
+i miss you so much
+good morning
+good night
+have a good day
+have a great day at work
+have fun at {place}
+see you {when}
+see you soon
+see you later
+talk to you later
+i'll see you {when}
+i'll call you later
+i'll be home soon
+i'll do it {when}
+i'll take care of it
+i'll think about it
+i'll be right there
+i'll be there as soon as i can
+we need to leave soon
+we need to go to {place} {when}
+we're going to {place} {when}
+we should leave by {clock}
+we have to be there by {clock}
+we just got home
+we just left {place}
+you should come with us
+you should go to {place}
+you should call {person}
+you need to {chore}
+you were right
+you're so {adj}
+you're going to love it
+you're going to do great
+yeah that's fine
+yeah i'm on my way
+yeah i know
+yeah i saw that
+yeah i think so
+yeah for sure
+yeah what time
+lol that's so {adj}
+lol i know right
+lol what
+omg that's so {adj}
+omg i forgot
+oh i see
+oh yeah i forgot about that
+oh no what happened
+ok sounds good
+ok i'll be there
+ok let me know
+ok see you then
+okay that works
+okay i'll do that
+okay thanks

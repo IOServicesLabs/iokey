@@ -14,3 +14,4 @@ dependencyResolutionManagement {
 }
 rootProject.name = "TinyLLMKeyboard"
 include(":app")
+include(":e2e")

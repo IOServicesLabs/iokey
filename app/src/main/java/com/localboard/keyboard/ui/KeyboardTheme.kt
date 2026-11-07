@@ -206,8 +206,22 @@ data class KeyboardTheme(
                     divider = c(R.color.kb_light_divider), trail = c(R.color.kb_light_trail),
                     popupBackground = c(R.color.kb_light_popup_bg), isDark = false
                 )
-                // No palette chosen: the mid-century look is the default.
-                "" -> fromPalette(EXTRA_PALETTES.first { it.id == "midcentury" })
+                // No palette chosen: the keyboard follows the system's day/night
+                // mode — the mid-century look by day, the Gboard-like dark
+                // palette at night. The mechanism is the live configuration's
+                // uiMode, read in [isNight]; a flip is picked up on the next
+                // show because [signature] carries isNight into the cache key.
+                "" -> if (isNight(context)) {
+                    KeyboardTheme(
+                        background = c(R.color.kb_dark_bg), key = c(R.color.kb_dark_key),
+                        keyFunctional = c(R.color.kb_dark_key_function), text = c(R.color.kb_dark_text),
+                        textSecondary = c(R.color.kb_dark_text_secondary), accent = c(R.color.kb_dark_accent),
+                        divider = c(R.color.kb_dark_divider), trail = c(R.color.kb_dark_trail),
+                        popupBackground = c(R.color.kb_dark_popup_bg), isDark = true
+                    )
+                } else {
+                    fromPalette(EXTRA_PALETTES.first { it.id == "midcentury" })
+                }
                 "dark" -> KeyboardTheme(
                     background = c(R.color.kb_dark_bg), key = c(R.color.kb_dark_key),
                     keyFunctional = c(R.color.kb_dark_key_function), text = c(R.color.kb_dark_text),

@@ -23,8 +23,9 @@
         android:layout_height="wrap_content" />
 
     <!-- Fills the area behind the system navigation bar, which the IME window
-         extends into from API 35. Height is 0 until the first inset dispatch
-         says how tall the bar actually is, and stays 0 where it takes no
+         extends into from API 35. The 0dp here is only a starting value: each
+         show sizes it from the display's inset before anything measures, and
+         an inset dispatch can raise that. It stays 0 where the bar takes no
          space. Decorative only - the touchable region set in onComputeInsets
          excludes it, so it never receives a tap. -->
     <com.localboard.keyboard.ui.NavStripView

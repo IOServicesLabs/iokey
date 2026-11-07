@@ -1,6 +1,7 @@
 package com.localboard.keyboard
 
 import android.app.Application
+import com.localboard.keyboard.ime.SURVIVED_ERROR_MARK
 import java.io.PrintWriter
 import java.io.StringWriter
 
@@ -58,9 +59,43 @@ class LocalBoardApp : Application() {
             previous?.uncaughtException(thread, error)
                 ?: kotlin.system.exitProcess(10)
         }
+        // Repairs what older builds stored, before the keyboard or any screen reads a
+        // preference. After the crash handler and in its own catch: a keyboard with stale
+        // bytes in its preferences still types, and one that dies here does not. The repair
+        // and its stamp reach the disk together, so a failure is simply tried again at the
+        // next start.
+        try {
+            com.localboard.keyboard.util.PrefsMigrations.run(
+                com.localboard.keyboard.util.Prefs(this).migrationStore()
+            )
+        } catch (error: Throwable) {
+            try {
+                appendToLog("settings repair, $SURVIVED_ERROR_MARK", error)
+            } catch (_: Throwable) {
+                // The crash log itself must never crash the crash.
+            }
+        }
+        // These counts live in their own file, apart from the settings and so apart from
+        // backups: they describe this device, not the person's choices.
+        try {
+            val stored = getSharedPreferences(STATS_FILE, MODE_PRIVATE)
+            com.localboard.keyboard.util.LocalStats.attach(
+                object : com.localboard.keyboard.util.LocalStats.Store {
+                    override fun read(key: String): Long = stored.getLong(key, 0L)
+                    override fun write(key: String, value: Long) {
+                        stored.edit().putLong(key, value).apply()
+                    }
+                }
+            )
+        } catch (_: Throwable) {
+            // The counts then stay in memory. Nothing that types depends on them.
+        }
     }
 
-    private fun recordCrash(thread: Thread, error: Throwable) {
+    private fun recordCrash(thread: Thread, error: Throwable) =
+        appendToLog("thread=${thread.name}", error)
+
+    private fun appendToLog(label: String, error: Throwable) {
         val sw = StringWriter()
         error.printStackTrace(PrintWriter(sw))
         val ver = try {
@@ -68,7 +103,7 @@ class LocalBoardApp : Application() {
         } catch (t: Throwable) { "?" }
         val entry = buildString {
             append("═══ IOKey ").append(ver)
-            append(" · thread=").append(thread.name).append(" · ")
+            append(" · ").append(label).append(" · ")
             append(android.text.format.DateFormat.format("yyyy-MM-dd HH:mm:ss", System.currentTimeMillis()))
             append(" ═══\n")
             append(sw.toString().take(6000))
@@ -84,5 +119,6 @@ class LocalBoardApp : Application() {
 
     companion object {
         const val CRASH_FILE = "last_crash.txt"
+        private const val STATS_FILE = "local_stats"
     }
 }

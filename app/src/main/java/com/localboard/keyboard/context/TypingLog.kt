@@ -17,7 +17,8 @@ import kotlinx.coroutines.withContext
  */
 class TypingLog(context: Context) {
     private val appContext = context.applicationContext
-    private val db by lazy { AppDatabase.get(appContext) }
+    // Asked for each time: the store can be replaced while this object lives.
+    private val db get() = AppDatabase.get(appContext)
 
     suspend fun log(text: String, appPackage: String, screenKey: String = "") =
         withContext(Dispatchers.IO) {
@@ -46,7 +47,8 @@ class TypingLog(context: Context) {
     )
 
     /** Batch insert for the keyboard's write coalescing — one encrypted-DB
-     *  transaction per typing burst instead of one per committed word. */
+     *  transaction per typing burst instead of one per committed word. A failure
+     *  reaches the caller, which still holds these whole messages to put back. */
     suspend fun logAll(lines: List<PendingLine>) = withContext(Dispatchers.IO) {
         if (lines.isEmpty()) return@withContext
         val now = System.currentTimeMillis()
@@ -60,9 +62,7 @@ class TypingLog(context: Context) {
             )
         }
         if (entities.isEmpty()) return@withContext
-        try {
-            db.typingLogDao().insertAll(entities)
-        } catch (_: Throwable) { }
+        db.typingLogDao().insertAll(entities)
     }
 
     /** Newest-first fragments for one app — the "what was recently typed

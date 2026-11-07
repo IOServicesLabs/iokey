@@ -39,8 +39,13 @@ class KeyFeedback(context: Context) {
 
     private val loadedIds = HashSet<Int>()
 
-    private val soundPool: SoundPool? by lazy {
-        try {
+    // Built on demand rather than once: this object outlives a detach of its view (the
+    // emoji panel, a rotation), and a released pool stays silent for good.
+    private var soundPool: SoundPool? = null
+
+    private fun pool(): SoundPool? {
+        soundPool?.let { return it }
+        return try {
             SoundPool.Builder().setMaxStreams(3)
                 .setAudioAttributes(
                     AudioAttributes.Builder()
@@ -57,6 +62,7 @@ class KeyFeedback(context: Context) {
                             if (status == 0) loadedIds += sampleId
                         }
                     }
+                    soundPool = pool
                 }
         } catch (_: Throwable) { null }
     }
@@ -72,7 +78,7 @@ class KeyFeedback(context: Context) {
             3 -> R.raw.key_bubble
             else -> return null
         }
-        val sp = soundPool ?: return null
+        val sp = pool() ?: return null
         return try {
             val id = sp.load(appContext, res, 1)
             soundIds[pack] = id
@@ -158,7 +164,7 @@ class KeyFeedback(context: Context) {
 
     private fun playClick() {
         if (soundPack <= 0) return
-        val sp = soundPool ?: return
+        val sp = pool() ?: return
         val id = soundIdFor(soundPack) ?: return
         val vol = (soundVolume / 100f).coerceIn(0f, 1f)
         try { sp.play(id, vol, vol, 1, 0, 1f) } catch (_: Throwable) { }
@@ -166,8 +172,10 @@ class KeyFeedback(context: Context) {
 
     fun release() {
         try { soundPool?.release() } catch (_: Throwable) { }
+        soundPool = null
         // A released pool's sample ids are dead: drop them so this instance
-        // can never hand out a stale id (a re-load would mint fresh ones).
+        // can never hand out a stale id. The next press builds a new pool and
+        // loads afresh, so that press stays silent and the one after sounds.
         soundIds.clear()
         synchronized(loadedIds) { loadedIds.clear() }
     }

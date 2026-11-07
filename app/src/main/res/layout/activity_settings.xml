@@ -211,6 +211,14 @@
 
             <TextView style="@style/SettingsHint" android:text="@string/feat_swipe_learning_hint" />
 
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_reset_glide"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="@string/settings_reset_glide" />
+
             <com.google.android.material.materialswitch.MaterialSwitch
                 android:id="@+id/switch_swipe_double"
                 android:layout_width="match_parent"
@@ -251,15 +259,6 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:text="@string/feat_snippets_edit" />
-
-            <com.google.android.material.materialswitch.MaterialSwitch
-                android:id="@+id/switch_per_app_theme"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="6dp"
-                android:text="@string/feat_per_app_theme" />
-
-            <TextView style="@style/SettingsHint" android:text="@string/feat_per_app_theme_hint" />
 
             <TextView style="@style/SettingsLabel" android:text="@string/feat_one_handed" />
 
@@ -467,14 +466,6 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
                 android:text="@string/settings_writing_profiles" />
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/btn_calibrate"
-                style="@style/Widget.Material3.Button.OutlinedButton"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:text="@string/settings_calibrate" />
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/btn_retrain"
@@ -944,8 +935,7 @@
             <SeekBar
                 android:id="@+id/seek_wallpaper_dim"
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:max="100" />
+                android:layout_height="wrap_content" />
         </LinearLayout>
 
         <!-- ══════════ Learning & AI ══════════ -->
@@ -1161,44 +1151,6 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="6dp"
                 android:text="@string/diag_copy" />
-
-            <TextView
-                android:id="@+id/label_offset_x"
-                style="@style/SettingsLabel"
-                android:text="@string/settings_offset_x" />
-
-            <SeekBar
-                android:id="@+id/seek_offset_x"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content" />
-
-            <TextView
-                android:id="@+id/label_offset_y"
-                style="@style/SettingsLabel"
-                android:text="@string/settings_offset_y" />
-
-            <SeekBar
-                android:id="@+id/seek_offset_y"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content" />
-
-            <EditText
-                android:id="@+id/model_instructions"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:gravity="top"
-                android:hint="@string/settings_model_instructions"
-                android:inputType="textMultiLine"
-                android:minLines="2" />
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/btn_reset_fingerfit"
-                style="@style/Widget.Material3.Button.OutlinedButton"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:text="@string/settings_reset_fingerfit" />
         </LinearLayout>
 
     </LinearLayout>

@@ -26,8 +26,11 @@ import com.localboard.keyboard.llm.ModelManager
 import com.localboard.keyboard.llm.ProviderRegistry
 import com.localboard.keyboard.onboarding.OnboardingActivity
 import com.localboard.keyboard.util.ChatExportParser
+import com.localboard.keyboard.util.LocalStats
+import com.localboard.keyboard.util.NetGuard
 import com.localboard.keyboard.util.Prefs
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -39,9 +42,7 @@ import kotlinx.coroutines.withContext
 class SettingsActivity : AppCompatActivity() {
 
     private lateinit var prefs: Prefs
-    private val contextEngine by lazy {
-        ContextEngine(applicationContext, FastEngine.shared(applicationContext))
-    }
+    private val contextEngine by lazy { ContextEngine.shared(applicationContext) }
 
     /** Chat-export file picker (WhatsApp "Export chat" .txt and similar). */
     private val pickChatExport = registerForActivityResult(
@@ -140,7 +141,88 @@ class SettingsActivity : AppCompatActivity() {
         lifecycleScope.launch {
             contextEngine.initialize()
             refreshEngineStatus()
+            offerStartFresh()
+            refreshDiagnostics()
         }
+        showKeysResetNoticeOnce()
+    }
+
+    /**
+     * Only while the store will not open, which is when typing goes on and nothing gets saved. Built
+     * here rather than in the layout, because the section collapsing shows everything a section's
+     * layout holds when it opens, and because this has to show even in a collapsed section. The
+     * button comes only once the failure has lasted, and never where giving up the words would not
+     * help: a full disk or a missing library loses nothing by waiting, and the note says what to do.
+     */
+    private fun offerStartFresh() {
+        val advice = contextEngine.storeAdvice
+        val noteText = when (advice) {
+            com.localboard.keyboard.context.StoreAdvice.NONE -> return
+            com.localboard.keyboard.context.StoreAdvice.WAIT -> R.string.settings_store_waiting
+            com.localboard.keyboard.context.StoreAdvice.START_FRESH -> R.string.settings_start_fresh_hint
+            com.localboard.keyboard.context.StoreAdvice.FREE_SPACE -> R.string.settings_store_full
+            com.localboard.keyboard.context.StoreAdvice.UPDATE_APP -> R.string.settings_store_no_library
+        }
+        val anchor = findViewById<View>(R.id.btn_clear) ?: return
+        val card = anchor.parent as? android.view.ViewGroup ?: return
+        val density = resources.displayMetrics.density
+        val note = TextView(this).apply {
+            text = getString(noteText)
+            setTextColor(resources.getColor(R.color.app_text_secondary, theme))
+            textSize = 12f
+            setPadding(0, (12 * density).toInt(), 0, 0)
+        }
+        val at = card.indexOfChild(anchor) + 1
+        card.addView(note, at)
+        var lastAdded: View = note
+        if (advice == com.localboard.keyboard.context.StoreAdvice.START_FRESH) {
+            lastAdded = MaterialButton(this).apply {
+                text = getString(R.string.settings_start_fresh)
+                setOnClickListener { confirmStartFresh() }
+            }
+            card.addView(lastAdded, at + 1)
+        }
+        // Someone who came from the keyboard's notice came for this, and it is far down the page.
+        if (intent.getBooleanExtra(com.localboard.keyboard.context.EXTRA_SHOW_STORE_NOTE, false)) {
+            lastAdded.post {
+                lastAdded.requestRectangleOnScreen(android.graphics.Rect(0, 0, lastAdded.width, lastAdded.height), true)
+            }
+        }
+    }
+
+    private fun confirmStartFresh() {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.settings_start_fresh)
+            .setMessage(R.string.settings_start_fresh_confirm)
+            .setNegativeButton(R.string.cancel, null)
+            .setPositiveButton(R.string.settings_start_fresh) { _, _ ->
+                lifecycleScope.launch {
+                    val result = contextEngine.startFresh()
+                    Toast.makeText(
+                        applicationContext,
+                        when (result) {
+                            ContextEngine.StartFreshResult.NOT_NEEDED -> R.string.settings_start_fresh_not_needed
+                            ContextEngine.StartFreshResult.STARTED_FRESH -> R.string.settings_start_fresh_done
+                            ContextEngine.StartFreshResult.FAILED -> R.string.settings_start_fresh_failed
+                        },
+                        Toast.LENGTH_LONG
+                    ).show()
+                    if (result != ContextEngine.StartFreshResult.FAILED && !isFinishing && !isDestroyed) reopenSettings()
+                }
+            }
+            .show()
+    }
+
+    /** Only when an update really did put moved keys back. It says what changed and
+     *  promises nothing beyond that: keys that stay put do not by themselves mean fewer
+     *  wrong letters. */
+    private fun showKeysResetNoticeOnce() {
+        if (!prefs.takeKeysResetNotice()) return
+        AlertDialog.Builder(this)
+            .setTitle(R.string.keys_stay_title)
+            .setMessage(R.string.keys_reset_notice)
+            .setPositiveButton(R.string.done, null)
+            .show()
     }
 
     // ------------------------------------------------------------------
@@ -330,22 +412,30 @@ class SettingsActivity : AppCompatActivity() {
         }
     }
 
+    private fun confirmResetGlide() {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.settings_reset_glide)
+            .setMessage(R.string.settings_reset_glide_confirm)
+            .setNegativeButton(R.string.cancel, null)
+            .setPositiveButton(R.string.settings_reset_glide) { _, _ ->
+                prefs.swipeBiasData = ""
+                prefs.swipeBiasResetPending = true
+                Toast.makeText(this, R.string.settings_reset_glide_done, Toast.LENGTH_SHORT).show()
+            }
+            .show()
+    }
+
     /**
      * Every new feature is a switch here. The defaults are chosen to be the
      * behaviour most people want without asking (glide learning and doubled
-     * letters on, clipboard history on but expiring, per-app themes off
-     * because a keyboard that changes colour unexpectedly is worse than one
-     * that doesn't) — but nothing is mandatory.
+     * letters on, clipboard history on but expiring) — but nothing is mandatory.
      */
     private fun wireFeatureToggles() {
         bindSwitch(R.id.switch_swipe_learning, prefs.swipeLearning) { prefs.swipeLearning = it }
+        findViewById<MaterialButton>(R.id.btn_reset_glide).setOnClickListener { confirmResetGlide() }
         bindSwitch(R.id.switch_swipe_double, prefs.swipeDoubleLetter) { prefs.swipeDoubleLetter = it }
         bindSwitch(R.id.switch_clip_history, prefs.clipboardHistory) { prefs.clipboardHistory = it }
         bindSwitch(R.id.switch_snippets, prefs.snippetsEnabled) { prefs.snippetsEnabled = it }
-        bindSwitch(R.id.switch_per_app_theme, prefs.perAppThemes) {
-            prefs.perAppThemes = it
-            com.localboard.keyboard.ui.KeyboardTheme.invalidateCache()
-        }
 
         // Clip expiry: 0..1440 min in coarse, human steps rather than a
         // meaningless continuous slider.
@@ -519,7 +609,7 @@ class SettingsActivity : AppCompatActivity() {
                     .firstOrNull { it.id == prefs.paletteId }?.label
                     ?: prefs.paletteId.replaceFirstChar { it.uppercase() }
             }
-            "$palette · height ${(prefs.heightScale * 100).toInt()}%"
+            "$palette · height ${Math.round(prefs.heightScale * 100)}%"
         }
         getString(R.string.sec_typing_feel) -> buildList {
             add(when (prefs.vibLevel) {
@@ -681,9 +771,10 @@ class SettingsActivity : AppCompatActivity() {
         val dimLabel = findViewById<TextView>(R.id.label_wallpaper_dim)
         fun renderDim(v: Float) {
             dimLabel.text = getString(R.string.settings_wallpaper_dim) +
-                " — ${(v * 100).toInt()}%"
+                " — ${Math.round(v * 100)}%"
         }
-        dimSeek.progress = (prefs.wallpaperDim * 100).toInt()
+        dimSeek.max = 85 // 0.00 .. 0.85
+        dimSeek.progress = Math.round(prefs.wallpaperDim * 100)
         renderDim(prefs.wallpaperDim)
         dimSeek.setOnSeekBarChangeListener(simpleSeek { p ->
             prefs.wallpaperDim = p / 100f
@@ -735,10 +826,8 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     // ------------------------------------------------------------------
-    // Relaxing ambience: staggered section entrances + a slow breathing tint
+    // Relaxing ambience: staggered section entrances
     // ------------------------------------------------------------------
-
-    private var breathingAnimator: android.animation.ValueAnimator? = null
 
     private fun startRelaxingAnimations() {
         val content = findViewById<android.view.ViewGroup>(android.R.id.content)
@@ -759,24 +848,6 @@ class SettingsActivity : AppCompatActivity() {
                 .setInterpolator(android.view.animation.DecelerateInterpolator())
                 .start()
         }
-
-        // The background slowly breathes between two warm cream tones.
-        val from = androidx.core.content.ContextCompat.getColor(this, R.color.app_bg)
-        val to = 0xFFE7DAC2.toInt()
-        breathingAnimator = android.animation.ValueAnimator.ofArgb(from, to).apply {
-            duration = 6000
-            repeatMode = android.animation.ValueAnimator.REVERSE
-            repeatCount = android.animation.ValueAnimator.INFINITE
-            interpolator = android.view.animation.AccelerateDecelerateInterpolator()
-            addUpdateListener { scroll.setBackgroundColor(it.animatedValue as Int) }
-            start()
-        }
-    }
-
-    override fun onDestroy() {
-        breathingAnimator?.cancel()
-        breathingAnimator = null
-        super.onDestroy()
     }
 
     // ------------------------------------------------------------------
@@ -792,35 +863,18 @@ class SettingsActivity : AppCompatActivity() {
 
         fun renderHeight(v: Float) {
             heightLabel.text = getString(R.string.settings_keyboard_height) +
-                " — ${(v * 100).toInt()}%"
+                " — ${Math.round(v * 100)}%"
         }
         fun renderText(v: Float) {
             textLabel.text = getString(R.string.settings_key_text_size) +
-                " — ${(v * 100).toInt()}%"
+                " — ${Math.round(v * 100)}%"
         }
-        heightSeek.progress = (prefs.heightScale * 100).toInt() - 60
-        textSeek.progress = (prefs.keyTextScale * 100).toInt() - 70
+        heightSeek.max = 90
+        textSeek.max = 70
+        heightSeek.progress = Math.round(prefs.heightScale * 100) - 60
+        textSeek.progress = Math.round(prefs.keyTextScale * 100) - 70
         renderHeight(prefs.heightScale)
         renderText(prefs.keyTextScale)
-        heightSeek.setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: android.widget.SeekBar?, p: Int, fromUser: Boolean) {
-                val v = (p + 60) / 100f
-                prefs.heightScale = v
-                renderHeight(v)
-            }
-            override fun onStartTrackingTouch(s: android.widget.SeekBar?) {}
-            override fun onStopTrackingTouch(s: android.widget.SeekBar?) {}
-        })
-        textSeek.setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: android.widget.SeekBar?, p: Int, fromUser: Boolean) {
-                val v = (p + 70) / 100f
-                prefs.keyTextScale = v
-                renderText(v)
-            }
-            override fun onStartTrackingTouch(s: android.widget.SeekBar?) {}
-            override fun onStopTrackingTouch(s: android.widget.SeekBar?) {}
-        })
-
 
         // Custom color overrides.
         val bgIn = findViewById<android.widget.EditText>(R.id.input_custom_bg)
@@ -966,25 +1020,15 @@ class SettingsActivity : AppCompatActivity() {
 
         refreshPreview()
         buildGallery()
-        heightSeek.setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: android.widget.SeekBar?, p: Int, fromUser: Boolean) {
-                val v = (p + 60) / 100f
-                prefs.heightScale = v
-                renderHeight(v)
-                refreshPreview()
-            }
-            override fun onStartTrackingTouch(s: android.widget.SeekBar?) {}
-            override fun onStopTrackingTouch(s: android.widget.SeekBar?) {}
+        heightSeek.setOnSeekBarChangeListener(simpleSeek { p ->
+            prefs.heightScale = (p + 60) / 100f
+            renderHeight(prefs.heightScale)
+            refreshPreview()
         })
-        textSeek.setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: android.widget.SeekBar?, p: Int, fromUser: Boolean) {
-                val v = (p + 70) / 100f
-                prefs.keyTextScale = v
-                renderText(v)
-                refreshPreview()
-            }
-            override fun onStartTrackingTouch(s: android.widget.SeekBar?) {}
-            override fun onStopTrackingTouch(s: android.widget.SeekBar?) {}
+        textSeek.setOnSeekBarChangeListener(simpleSeek { p ->
+            prefs.keyTextScale = (p + 70) / 100f
+            renderText(prefs.keyTextScale)
+            refreshPreview()
         })
 
         // Corner radius: 0 on the seekbar = the palette's own roundness.
@@ -1025,9 +1069,6 @@ class SettingsActivity : AppCompatActivity() {
         findViewById<MaterialButton>(R.id.btn_writing_profiles).setOnClickListener {
             showProfilesDialog()
         }
-        findViewById<MaterialButton>(R.id.btn_calibrate).setOnClickListener {
-            startActivity(Intent(this, CalibrateActivity::class.java))
-        }
     }
 
     override fun onResume() {
@@ -1046,11 +1087,11 @@ class SettingsActivity : AppCompatActivity() {
 
     /** The AI-phrase-suggestions row is built in code, not XML: the feature
      *  is confined to a few files, so instead of touching the shared layout
-     *  the row is inserted right before the model-instructions box at
+     *  the row is inserted right after the diagnostics copy button at
      *  runtime. onCreate runs this BEFORE wireSectionCollapsing()/wireSearch(),
      *  so the new views join section collapsing and search like any XML child. */
     private fun addAiSuggestionsRow() {
-        val anchor = findViewById<android.view.View>(R.id.model_instructions) ?: return
+        val anchor = findViewById<android.view.View>(R.id.btn_diag_copy) ?: return
         val parent = anchor.parent as? android.view.ViewGroup ?: return
         val density = resources.displayMetrics.density
         fun dp(v: Int) = (v * density).toInt()
@@ -1073,7 +1114,7 @@ class SettingsActivity : AppCompatActivity() {
         }
         aiSuggestionsSubtitle = subtitle
         row.addView(subtitle)
-        parent.addView(row, parent.indexOfChild(anchor))
+        parent.addView(row, parent.indexOfChild(anchor) + 1)
         refreshAiSuggestionsRow()
     }
 
@@ -1121,13 +1162,13 @@ class SettingsActivity : AppCompatActivity() {
         // uncaught crash leaves its stack here for a copy-paste report.
         val crashLine = try {
             val f = java.io.File(filesDir, com.localboard.keyboard.LocalBoardApp.CRASH_FILE)
-            if (f.exists() && f.length() > 0) {
-                val crashes = f.readText().split("═══").filter { it.isNotBlank() }
-                "crash log: ${crashes.size} crash(es) on record — copy to report"
-            } else "crash log: clean — no crashes recorded"
+            val crashes = if (f.exists()) recordedCrashCount(f.readText()) else 0
+            if (crashes > 0) "crash log: $crashes crash(es) on record — copy to report"
+            else "crash log: clean — no crashes recorded"
         } catch (t: Throwable) { "crash log: unreadable" }
+        val storageLines = wordStorageLines()
         val report = com.localboard.keyboard.llm.AiDiagLog.report(modelLine, screenLine) +
-            "\n" + crashLine
+            "\n" + storageLines + crashLine
         body.text = report
         findViewById<MaterialButton>(R.id.btn_diag_copy)?.setOnClickListener {
             val crashText = try {
@@ -1140,10 +1181,22 @@ class SettingsActivity : AppCompatActivity() {
                     "IOKey AI diagnostics",
                     "IOKey ${try { packageManager.getPackageInfo(packageName, 0).versionName } catch (t: Throwable) { "" }}\n" +
                         com.localboard.keyboard.llm.AiDiagLog.report(modelLine, screenLine) +
-                        "\n" + crashLine + crashText
+                        "\n" + storageLines + crashLine + crashText
                 )
             )
             Toast.makeText(this, "Diagnostics copied — paste them anywhere", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /** What is wrong with saved words right now, and any copy left aside by an earlier run,
+     *  which is the one record of that surviving the process that moved it. */
+    private fun wordStorageLines(): String = buildString {
+        contextEngine.storageProblem?.let { append("word storage: ").append(it).append('\n') }
+        com.localboard.keyboard.data.db.AppDatabase.setAsideCopy(this@SettingsActivity)?.let { copy ->
+            val day = java.text.DateFormat.getDateInstance().format(java.util.Date(copy.lastModified()))
+            append("word storage: saved words the keyboard could not use were moved aside on ")
+            append(day).append(" (").append(copy.length() / 1024).append(" KB). They stay on this ")
+            append("phone until another set replaces them, you block an app or you erase your data.\n")
         }
     }
 
@@ -1355,9 +1408,10 @@ class SettingsActivity : AppCompatActivity() {
         val sensLabel = findViewById<TextView>(R.id.label_swipe_sens)
         fun renderSens() {
             sensLabel.text = getString(R.string.settings_swipe_sens) +
-                " — ${(prefs.swipeSensitivity * 100).toInt()}%"
+                " — ${Math.round(prefs.swipeSensitivity * 100)}%"
         }
-        sensSeek.progress = (prefs.swipeSensitivity * 100).toInt() - 60
+        sensSeek.max = 80
+        sensSeek.progress = Math.round(prefs.swipeSensitivity * 100) - 60
         renderSens()
         sensSeek.setOnSeekBarChangeListener(simpleSeek { p ->
             prefs.swipeSensitivity = (p + 60) / 100f
@@ -1370,36 +1424,12 @@ class SettingsActivity : AppCompatActivity() {
         fun renderLp() {
             lpLabel.text = getString(R.string.settings_longpress) + " — ${prefs.longPressMs}ms"
         }
+        lpSeek.max = 35
         lpSeek.progress = (prefs.longPressMs - 250) / 10
         renderLp()
         lpSeek.setOnSeekBarChangeListener(simpleSeek { p ->
             prefs.longPressMs = 250 + p * 10
             renderLp()
-        })
-
-        // Manual key-grid shift (−48…+48 dp each axis).
-        val oxSeek = findViewById<android.widget.SeekBar>(R.id.seek_offset_x)
-        val oxLabel = findViewById<TextView>(R.id.label_offset_x)
-        fun renderOx() {
-            oxLabel.text = getString(R.string.settings_offset_x) + " — ${prefs.keyOffsetXDp.toInt()}dp"
-        }
-        oxSeek.progress = prefs.keyOffsetXDp.toInt() + 48
-        renderOx()
-        oxSeek.setOnSeekBarChangeListener(simpleSeek { p ->
-            prefs.keyOffsetXDp = (p - 48).toFloat()
-            renderOx()
-        })
-
-        val oySeek = findViewById<android.widget.SeekBar>(R.id.seek_offset_y)
-        val oyLabel = findViewById<TextView>(R.id.label_offset_y)
-        fun renderOy() {
-            oyLabel.text = getString(R.string.settings_offset_y) + " — ${prefs.keyOffsetYDp.toInt()}dp"
-        }
-        oySeek.progress = prefs.keyOffsetYDp.toInt() + 48
-        renderOy()
-        oySeek.setOnSeekBarChangeListener(simpleSeek { p ->
-            prefs.keyOffsetYDp = (p - 48).toFloat()
-            renderOy()
         })
     }
 
@@ -1814,10 +1844,7 @@ class SettingsActivity : AppCompatActivity() {
     /** Rows owned by the Advanced switch. Section collapsing must leave these
      *  alone, or expanding a section would resurrect hidden advanced rows. */
     private val advancedIds = intArrayOf(
-        R.id.label_offset_x, R.id.seek_offset_x,
-        R.id.label_offset_y, R.id.seek_offset_y,
-        R.id.model_instructions,
-        R.id.btn_reset_fingerfit, R.id.engine_status,
+        R.id.engine_status,
         R.id.diag_ai, R.id.diag_ai_body, R.id.btn_diag_copy
     )
 
@@ -1839,20 +1866,6 @@ class SettingsActivity : AppCompatActivity() {
             applyAdvancedVisibility(show)
         }
         applyAdvancedVisibility(prefs.showAdvanced)
-
-        findViewById<MaterialButton>(R.id.btn_reset_fingerfit).setOnClickListener {
-            prefs.tapModelData = ""
-            // keyFitData moves the KEYS, so a reset that left it in place
-            // would look like it had done nothing at all.
-            prefs.keyFitData = ""
-            prefs.keyOffsetXDp = 0f
-            prefs.keyOffsetYDp = 0f
-            android.widget.Toast.makeText(
-                this,
-                "Finger fit reset — keys back to standard positions",
-                android.widget.Toast.LENGTH_SHORT
-            ).show()
-        }
     }
 
     private companion object {
@@ -1980,9 +1993,9 @@ class SettingsActivity : AppCompatActivity() {
                 val url = urlInput.text.toString().trim()
                 val name = nameInput.text.toString().trim()
                     .ifBlank { url.substringAfterLast('/').removeSuffix(".gguf") }
-                if (!url.startsWith("http") || !url.contains(".gguf", ignoreCase = true)) {
+                if (!url.startsWith("https://", ignoreCase = true) || !url.contains(".gguf", ignoreCase = true)) {
                     android.widget.Toast.makeText(
-                        this, "Paste a direct .gguf download link",
+                        this, "Paste a direct https:// link to a .gguf file",
                         android.widget.Toast.LENGTH_LONG
                     ).show()
                     return@setPositiveButton
@@ -2001,9 +2014,9 @@ class SettingsActivity : AppCompatActivity() {
                     builtIn = false
                 )
                 com.localboard.keyboard.llm.ModelRegistry.addUserModel(prefs, spec)
+                // Stays as it is until this works: a model that works now is not given up for
+                // a link that may not, and the finished download takes over if nothing else works.
                 com.localboard.keyboard.llm.ModelRegistry.startDownload(applicationContext, spec)
-                prefs.activeModelId = spec.id
-                prefs.activeProviderId = LlamaCppProvider.PROVIDER_ID
                 rebuildModelList()
                 pollModelProgress()
             }
@@ -2067,7 +2080,7 @@ class SettingsActivity : AppCompatActivity() {
         for (spec in registryModels) {
             val state = com.localboard.keyboard.llm.ModelRegistry.state(applicationContext, spec)
             val selected = prefs.activeProviderId == LlamaCppProvider.PROVIDER_ID &&
-                prefs.activeModelId == spec.id
+                com.localboard.keyboard.llm.ModelRegistry.isChosenActive(com.localboard.keyboard.llm.ModelRegistry.storedActiveId(applicationContext), spec.id)
             val subtitle = buildString {
                 append(spec.sizeLabel).append(" · ").append(spec.template.label)
                 append(" · ctx ").append(spec.nCtx)
@@ -2243,7 +2256,20 @@ class SettingsActivity : AppCompatActivity() {
                     checked[which] = isChecked
                     prefs.setAppBlocked(pkgs[which], isChecked)
                     if (isChecked) {
-                        lifecycleScope.launch { contextEngine.eraseAppData(pkgs[which]) }
+                        lifecycleScope.launch {
+                            // Has to finish and say how it went, even if this screen
+                            // goes away part way through.
+                            withContext(NonCancellable) {
+                                if (!contextEngine.eraseAppData(pkgs[which])) {
+                                    Toast.makeText(
+                                        applicationContext,
+                                        "Some of what was saved from ${labels[which]} could not " +
+                                            "be removed. Untick it and tick it again to retry.",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                }
+                            }
+                        }
                     }
                 }
                 .setPositiveButton(android.R.string.ok, null)
@@ -2273,21 +2299,64 @@ class SettingsActivity : AppCompatActivity() {
             .setNegativeButton(R.string.cancel, null)
             .setPositiveButton(R.string.erase) { _, _ ->
                 lifecycleScope.launch {
-                    // Full wipe: every database table (learned words, style,
-                    // profiles history, typing log, usage), the screen buffer,
-                    // and every preference (style prompt, finger-fit
-                    // calibration, settings) — a real factory reset. Model
-                    // downloads stay on disk (not personal data).
-                    contextEngine.eraseAllLearnedData()
-                    prefs.clearAll()
-                    refreshEngineStatus()
-                    Toast.makeText(
-                        this@SettingsActivity,
-                        "All data erased", Toast.LENGTH_LONG
-                    ).show()
-                    recreate()
+                    // Once confirmed it has to finish, even if this screen goes
+                    // away part way through.
+                    withContext(NonCancellable) { reportErase(eraseEverything()) }
                 }
             }
             .show()
+    }
+
+    /** Full wipe: every database table (learned words, style, profiles history,
+     *  typing log, usage), the screen buffer, the wallpaper copy and every
+     *  preference (style prompt, settings) apart from [Prefs.ERASE_KEEPS]. Model
+     *  downloads stay on disk (not personal data).
+     *
+     *  @return false when something personal may still be on this device. */
+    private suspend fun eraseEverything(): Boolean {
+        val storeWiped = contextEngine.eraseAllLearnedData()
+        val prefsCleared = prefs.clearAllExcept(Prefs.ERASE_KEEPS)
+        // The running keyboard holds its own copy of the glide learning just erased.
+        prefs.swipeBiasResetPending = true
+        NetGuard.init(Prefs(applicationContext))
+        com.localboard.keyboard.ui.KeyboardTheme.invalidateCache()
+        LocalStats.reset()
+        com.localboard.keyboard.util.PhoneStats.eraseNightly(this)
+        val wallpaper = java.io.File(filesDir, "keyboard_wallpaper.jpg")
+        val wallpaperGone = !wallpaper.exists() || wallpaper.delete()
+        return storeWiped && prefsCleared && wallpaperGone
+    }
+
+    /** Says how the erase went, then reloads this screen if it is still here. */
+    private fun reportErase(erased: Boolean) {
+        val screenGone = isFinishing || isDestroyed
+        if (erased || screenGone) {
+            Toast.makeText(
+                applicationContext,
+                if (erased) "All data erased" else "Not everything could be erased. Try Erase again.",
+                Toast.LENGTH_LONG
+            ).show()
+            if (!screenGone) reopenSettings()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Not everything was erased")
+            .setMessage(
+                "Some of what the keyboard saved could not be removed from this device: " +
+                    "saved words, typing history, settings or the wallpaper copy may still " +
+                    "be there. Restart the phone and try Erase again. If that doesn't work, " +
+                    "uninstalling IOKey removes all of it."
+            )
+            .setCancelable(false)
+            .setPositiveButton(android.R.string.ok) { _, _ -> reopenSettings() }
+            .show()
+    }
+
+    /** A new instance rather than recreate(), which hands every control its saved
+     *  state back: the switch listeners would then write the old settings straight
+     *  over the reset. */
+    private fun reopenSettings() {
+        startActivity(Intent(this, SettingsActivity::class.java))
+        finish()
     }
 }

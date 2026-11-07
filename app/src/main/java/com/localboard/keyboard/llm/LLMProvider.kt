@@ -36,10 +36,49 @@ data class GenerateRequest(
      *  PROFILE outputs (style distillation) must NOT be mangled by the
      *  message sanitizer, and their context is the SAMPLE itself — never
      *  shrink it away to fit the prompt. */
-    val purpose: Purpose = Purpose.MESSAGE
+    val purpose: Purpose = Purpose.MESSAGE,
+    /** The text a rewrite replaces. It reaches the prompt whole, or the run is refused with
+     *  [PromptTooLongException]: on success the field loses this text, so a model that only saw
+     *  part of it would lose the rest. Set, [instruction] says how to rewrite it. */
+    val rewriteSource: String? = null,
+    /** Someone is watching this run, as opposed to a next-word pass or the nightly worker. */
+    val userWaiting: Boolean = false,
+    /** The field asked not to be remembered, so this prompt is not kept for the AI diagnostics. */
+    val doNotRecordPrompt: Boolean = false,
+    /** Hears how this run is going. Called on the generation thread. */
+    val events: GenerateEvents? = null
 ) {
     enum class Purpose { MESSAGE, PROFILE }
+
+    /** The verdict on what the model wrote for this request. A rewrite is compared with no
+     *  turns, because staying close to its source is the whole point. */
+    fun review(raw: String, words: Int = maxWords): OutputSanitizer.Verdict =
+        if (rewriteSource != null) OutputSanitizer.review(raw, words)
+        else OutputSanitizer.review(
+            raw, words, OutputSanitizer.recentTurnsOf(contextBefore), voiceExamples, contextBefore
+        )
 }
+
+/** Where a run is. Only the last two are the model working on this request. */
+enum class GenerateStage { LOADING, WAITING, READING, WRITING }
+
+/** All optional: most callers only want the finished text. */
+interface GenerateEvents {
+    /** WRITING repeats with every token, which is how a listener can tell it has not stalled. */
+    fun onStage(stage: GenerateStage) {}
+
+    /** The model wrote something and it cannot be used. [LLMProvider.generate] returned "" for it. */
+    fun onRejected(rejected: OutputSanitizer.Rejected) {}
+
+    /** The engine's finish code, as named by [AiDiagLog.finishLabel]. */
+    fun onFinished(code: Int) {}
+}
+
+/** What the user asked for cannot fit the model's window, even with all the context shed. */
+class PromptTooLongException : IllegalStateException("prompt does not fit the context window")
+
+/** The model file is there and the engine could not load it. */
+class ModelLoadException(model: String) : IllegalStateException("$model: model load failed")
 
 /**
  * Plugin contract from the architecture doc: any language-model backend —

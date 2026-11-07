@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- This version carries Google Play's billing library, which sets up its own uploader to
+         Google at every process start. IOKey's network switch does not see or stop it, so the
+         welcome text has to say so. -->
+    <string name="onb_welcome_body">IOKey is a privacy-first keyboard with a tiny on-device language model.\n\n• Your typing stays on this phone\n• IOKey goes online to download the models you choose, including voice models and links you add, and you can switch that off\n• Learns your writing style locally\n• Encrypted on-device storage\n• No analytics or accounts of its own\n\nThe Play version also includes Google Play\'s billing library, which talks to Google Play and sends its own diagnostics to Google. IOKey gives it no typed text.</string>
+</resources>

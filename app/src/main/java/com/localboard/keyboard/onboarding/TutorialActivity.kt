@@ -245,9 +245,17 @@ class TutorialActivity : AppCompatActivity() {
             ),
             Card(
                 "✨", "Let it write the reply",
-                "Tap the sparkle and IOKey drafts a reply in your own voice, " +
-                    "using the conversation on screen. Hold the sparkle instead to " +
-                    "tell it what to say — \"say I'm running 10 minutes late\".",
+                "This needs a model on your phone, a one-time download. Set one up in " +
+                    "Settings, under AI model. The sparkle appears on the bar once a model is " +
+                    "active there. After that, tap it to get a draft you can accept or throw " +
+                    "away. Tap its words to read a long one in full. " +
+                    (if (com.localboard.keyboard.context.ScreenContextService.AVAILABLE)
+                        "To answer the conversation on screen it needs screen reading " +
+                            "turned on, and it will ask. "
+                    else
+                        "This version can't read the conversation on screen. ") +
+                    "Hold the sparkle to tell it what to say: " +
+                    "\"say I'm running 10 minutes late\".",
                 "Tap to draft · hold to instruct"
             ),
             Card(

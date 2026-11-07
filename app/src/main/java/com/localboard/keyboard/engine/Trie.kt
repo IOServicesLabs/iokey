@@ -11,6 +11,13 @@ class Trie {
         var frequency: Long = 0L
             private set
 
+        /** Sum of the terminal frequencies at or below this node, this node's
+         *  own included. Kept by [insert] and [remove], so what a word's next
+         *  letter is likely to be can be read straight off the children
+         *  without walking the subtrees under them. */
+        var subtree: Long = 0L
+            internal set
+
         fun terminal(freq: Long) {
             frequency = freq
         }
@@ -29,7 +36,10 @@ class Trie {
         // Max, not overwrite: injected word lists (CONTRACTIONS/TEXTING)
         // re-insert words the corpus already carries and must not lower the
         // base frequency the dictionary established.
-        if (frequency > node.frequency) node.terminal(frequency)
+        if (frequency > node.frequency) {
+            addToPath(word, frequency - node.frequency)
+            node.terminal(frequency)
+        }
     }
 
     /** Un-learn a word (typo suppression): keeps the path nodes, clears the
@@ -38,7 +48,20 @@ class Trie {
         val n = node(word) ?: return
         if (n.frequency > 0L) {
             wordCount--
+            addToPath(word, -n.frequency)
             n.terminal(0L)
+        }
+    }
+
+    /** Moves [delta] onto [Node.subtree] from the root down to [word]'s node.
+     *  Called while the node's old frequency is still readable, because the
+     *  delta is worked out from it. */
+    private fun addToPath(word: String, delta: Long) {
+        var n = root
+        n.subtree += delta
+        for (c in word) {
+            n = n.children[c] ?: return
+            n.subtree += delta
         }
     }
 

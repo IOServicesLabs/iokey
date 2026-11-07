@@ -19,7 +19,6 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.localboard.keyboard.context.ContextEngine
 import com.localboard.keyboard.context.StyleProfile
-import com.localboard.keyboard.engine.FastEngine
 import com.localboard.keyboard.llm.LlamaCppBridge
 import com.localboard.keyboard.llm.ModelManager
 import com.localboard.keyboard.onboarding.SMSReader
@@ -36,9 +35,7 @@ import kotlinx.coroutines.withContext
 class StyleActivity : AppCompatActivity() {
 
     private lateinit var prefs: Prefs
-    private val contextEngine by lazy {
-        ContextEngine(applicationContext, FastEngine.shared(applicationContext))
-    }
+    private val contextEngine by lazy { ContextEngine.shared(applicationContext) }
 
     private var distillDialog: AlertDialog? = null
     private var pendingDistill = false

@@ -10,9 +10,14 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.materialswitch.MaterialSwitch
+import com.localboard.keyboard.BuildConfig
 import com.localboard.keyboard.R
 import com.localboard.keyboard.ui.LiveBackground
 import com.localboard.keyboard.util.FrameStats
+import com.localboard.keyboard.util.GeometryLog
+import com.localboard.keyboard.util.LocalStats
+import com.localboard.keyboard.util.PhoneNumbers
+import com.localboard.keyboard.util.PhoneStats
 import com.localboard.keyboard.util.Prefs
 
 /**
@@ -120,8 +125,7 @@ class MotionActivity : AppCompatActivity() {
         val stripModes = listOf(
             0 to "Match the keyboard",
             1 to "A colour I pick",
-            2 to "Animated",
-            3 to "Off — give the space back"
+            2 to "Animated"
         )
         for ((value, label) in stripModes) {
             val chosen = prefs.navStripMode == value
@@ -134,17 +138,6 @@ class MotionActivity : AppCompatActivity() {
                 prefs.navStripMode = value
                 build()
             }
-        }
-
-        if (prefs.navStripMode == 3) {
-            hint(
-                "⚠ The keyboard gets shorter and the app above gets that space " +
-                    "back — but the bottom key row then sits under the navigation " +
-                    "bar, and the bar takes those taps first, so the arrow that " +
-                    "hides the keyboard may stop responding. Swipe down to " +
-                    "dismiss instead. Worth it on a small screen; annoying on a " +
-                    "large one."
-            )
         }
 
         if (prefs.navStripMode == 1) {
@@ -203,10 +196,7 @@ class MotionActivity : AppCompatActivity() {
         header("Counters")
         switchRow(
             "Track render counters",
-            "Frames drawn, how many of them repainted the whole keyboard, and how " +
-                "many frames each keystroke costs. Under about 4 frames per " +
-                "keystroke is healthy; 40 means every keypress is repainting the " +
-                "entire grid.",
+            "Frames drawn, and how many frames each keystroke costs.",
             prefs.showFrameStats
         ) { prefs.showFrameStats = it; build() }
 
@@ -219,6 +209,56 @@ class MotionActivity : AppCompatActivity() {
                     "adb shell dumpsys gfxinfo com.localboard.keyboard framestats"
             )
         }
+
+        // ------------------------------------------------------ keyboard window
+        header("Keyboard window")
+        hint(
+            "What the keyboard's window measured each time it came up, newest last, " +
+                "in pixels. If the keyboard ever sits too low or under the navigation " +
+                "bar, open this straight away and copy it. It holds numbers only, " +
+                "never anything you type. The measurements stay in memory and are gone " +
+                "when the keyboard's process ends. The count of short windows repaired " +
+                "is kept in a small file on this phone."
+        )
+        val windowText = "Short windows repaired: " +
+            LocalStats[LocalStats.Counter.STRIP_HEALED] + "\n\n" +
+            GeometryLog.summary().ifEmpty { "Nothing measured since the keyboard last started." }
+        mono(windowText)
+        button("Refresh measurements") { build() }
+
+        // ------------------------------------------------------- typing numbers
+        header("Typing numbers")
+        hint(
+            "Counts and times from this phone, so a decision about the keyboard can rest on what " +
+                "really happens here. Nothing you type is in them, and no hint text from any app."
+        )
+        val numbers = PhoneStats.blocks(this, BuildConfig.BUILD_TYPE)
+        for (block in numbers) {
+            mono(block.text)
+            hint(block.note)
+        }
+        button("Refresh numbers") { build() }
+        button("Copy these numbers") {
+            copyNumbers(PhoneNumbers.report(numbers) + "\n\nKeyboard window\n" + windowText)
+        }
+        hint(
+            "A copy holds these typing numbers and the keyboard window measurements, package names " +
+                "included, and no AI diagnostics."
+        )
+    }
+
+    /**
+     * Its own copy, not the AI diagnostics' one: that holds the last prompt verbatim once a draft
+     * has run, plus the crash log. Marked sensitive because this one names the apps typed into,
+     * and that also keeps it out of the keyboard's own clip history.
+     */
+    private fun copyNumbers(report: String) {
+        val clip = android.content.ClipData.newPlainText("IOKey typing numbers", report)
+        clip.description.extras = android.os.PersistableBundle().apply {
+            putBoolean(android.content.ClipDescription.EXTRA_IS_SENSITIVE, true)
+        }
+        (getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(clip)
+        android.widget.Toast.makeText(this, "Numbers copied", android.widget.Toast.LENGTH_SHORT).show()
     }
 
     // ------------------------------------------------------------- widgets

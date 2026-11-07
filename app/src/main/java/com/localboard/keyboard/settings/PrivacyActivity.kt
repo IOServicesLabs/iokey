@@ -15,7 +15,8 @@ import com.google.android.material.button.MaterialButton
 import com.google.android.material.materialswitch.MaterialSwitch
 import com.localboard.keyboard.R
 import com.localboard.keyboard.context.ContextEngine
-import com.localboard.keyboard.engine.FastEngine
+import com.localboard.keyboard.data.db.LegacyVerdictMigration
+import com.localboard.keyboard.ime.SURVIVED_ERROR_MARK
 import com.localboard.keyboard.util.BackupManager
 import com.localboard.keyboard.util.ContactNames
 import com.localboard.keyboard.util.NetGuard
@@ -24,6 +25,16 @@ import com.localboard.keyboard.util.Unlock
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+/**
+ * Crashes on record in the text of the crash log. Each entry opens with one header
+ * line, so those are what get counted: what follows a header is free-form stack
+ * trace, and the log is cut to size from the front, which can leave the tail of an
+ * older entry with no header of its own. Errors the keyboard survived sit in the
+ * same log but are not crashes.
+ */
+internal fun recordedCrashCount(log: String): Int =
+    log.lineSequence().count { it.startsWith("═══ IOKey ") && SURVIVED_ERROR_MARK !in it }
 
 /**
  * Data and network controls — the screen that makes the privacy claim
@@ -36,9 +47,7 @@ import kotlinx.coroutines.withContext
 class PrivacyActivity : AppCompatActivity() {
 
     private lateinit var prefs: Prefs
-    private val contextEngine by lazy {
-        ContextEngine(applicationContext, FastEngine.shared(applicationContext))
-    }
+    private val contextEngine by lazy { ContextEngine.shared(applicationContext) }
 
     private lateinit var root: LinearLayout
     private var pendingBackupJson: String? = null
@@ -147,7 +156,7 @@ class PrivacyActivity : AppCompatActivity() {
         // ---------------------------------------------------------- backup
         header("Backup")
         hint(
-            "Settings, theme, snippets, finger calibration and learned words. " +
+            "Settings, theme, snippets and learned words. " +
                 "Android cannot move app data between installs, so this file is " +
                 "the only way to carry them across."
         )
@@ -197,8 +206,12 @@ class PrivacyActivity : AppCompatActivity() {
         header("Diagnostics")
         val crash = java.io.File(filesDir, com.localboard.keyboard.LocalBoardApp.CRASH_FILE)
         if (crash.exists() && crash.length() > 0) {
-            val count = crash.readText().split("═══").size / 2
-            hint("$count recorded crash(es). Stored on this device only.")
+            val count = recordedCrashCount(crash.readText())
+            hint(
+                if (count > 0) "$count recorded crash(es). Stored on this device only."
+                else "No crashes recorded. The log holds errors the keyboard recovered from, " +
+                    "stored on this device only."
+            )
             button("View crash log") { showCrashLog(crash) }
             button("Clear crash log") { crash.delete(); build() }
         } else {
@@ -213,6 +226,9 @@ class PrivacyActivity : AppCompatActivity() {
             lifecycleScope.launch {
                 val words = withContext(Dispatchers.IO) {
                     try { contextEngine.learnedWordsForBackup(4000) } catch (_: Throwable) { emptyList() }
+                }
+                if (!contextEngine.persistenceAvailable) {
+                    Toast.makeText(this@PrivacyActivity, "Saved words can't be read right now, so this backup will not hold them", Toast.LENGTH_LONG).show()
                 }
                 pendingBackupJson = withContext(Dispatchers.Default) {
                     BackupManager.buildJson(prefs, words)
@@ -285,23 +301,42 @@ class PrivacyActivity : AppCompatActivity() {
             .setTitle("Restore backup")
             .setMessage(
                 "This will overwrite your current settings with " +
-                    BackupManager.describe(this, payload) + "."
+                    BackupManager.describe(this, payload) + "." +
+                    if (payload.fromOlderBuild) {
+                        "\n\nThis backup is from an older version of IOKey. It may hold only " +
+                            "part of what the keyboard had learned. Your keys stay in their " +
+                            "standard positions, whatever it stored about them."
+                    } else ""
             )
             .setNegativeButton(R.string.cancel, null)
             .setPositiveButton("Restore") { _, _ ->
                 lifecycleScope.launch {
                     BackupManager.restorePrefs(prefs, payload.prefs)
-                    withContext(Dispatchers.IO) {
+                    val wordsSaved = withContext(Dispatchers.IO) {
                         try {
                             contextEngine.initialize()
+                            val struck = LegacyVerdictMigration.struckWordsIn(
+                                contextEngine.styleStat(LegacyVerdictMigration.STRUCK_WORDS_KEY)
+                            )
                             // The backup preserved per-word counts; import
                             // them (MAX-upsert) instead of flattening
                             // everything to the default promotion strength.
-                            contextEngine.importExternalDictionaryWithCounts(payload.words)
-                        } catch (_: Throwable) { }
+                            contextEngine.importExternalDictionaryWithCounts(
+                                BackupManager.wordsToRestore(payload, struck)
+                            )
+                            // The import keeps going in memory when the store takes nothing.
+                            contextEngine.persistenceAvailable && contextEngine.storageProblem == null
+                        } catch (_: Throwable) {
+                            false
+                        }
                     }
-                    NetGuard.init(prefs)
-                    Toast.makeText(this@PrivacyActivity, "Restored", Toast.LENGTH_LONG).show()
+                    NetGuard.init(Prefs(applicationContext))
+                    Toast.makeText(
+                        this@PrivacyActivity,
+                        if (wordsSaved) "Restored"
+                        else "Settings restored. The words in the backup could not be saved, so the keyboard may lose them.",
+                        Toast.LENGTH_LONG
+                    ).show()
                     build()
                 }
             }

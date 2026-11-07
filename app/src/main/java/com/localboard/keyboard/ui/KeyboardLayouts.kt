@@ -181,15 +181,21 @@ object KeyboardLayouts {
             rows += RowModel((1..9).map { charKey(it.toString()) } + charKey("0"))
         }
 
-        // Gboard's long-press hints. Top row: the digit in the same seat
-        // (first key→1 … tenth→0). Home and bottom rows: the symbol in the
-        // same seat on the ?123 page. The hinted character leads the popup so
-        // hold-and-release types it; accent alternates follow. Non-letter
-        // keys in a layout (Dvorak's ' and .) get no hint — it would land on
-        // a key that already prints punctuation.
-        fun hinted(c: String, hint: String?): Key =
+        // Gboard's long-press hints, top row only: the digit in the same seat
+        // (first key→1 … tenth→0) shows above the key, and holding the key
+        // types it. The home and bottom rows keep their symbols one long-press
+        // away — the popup is byte-identical to what the hint always led, so
+        // @ # $ … still come off a, s, d … — but Gboard draws no hint there,
+        // so neither do we (hint = "" suppresses the drawn character without
+        // touching the popup). Non-letter keys in a layout (Dvorak's ' and .)
+        // get no hint — it would land on a key that already prints punctuation.
+        fun hinted(c: String, hint: String?, showHint: Boolean = true): Key =
             if (!opts.digitPopups || hint == null || !c[0].isLetter()) charKey(c)
-            else Key(c, c, KeyType.CHAR, popup = listOf(hint) + (POPUPS[c] ?: emptyList()))
+            else Key(
+                c, c, KeyType.CHAR,
+                popup = listOf(hint) + (POPUPS[c] ?: emptyList()),
+                hint = if (showHint) null else ""
+            )
         rows += RowModel(
             letters[0].map { it.toString() }.mapIndexed { i, c -> hinted(c, "${(i + 1) % 10}") }
         )
@@ -197,7 +203,7 @@ object KeyboardLayouts {
         // home row (AZERTY, Colemak, Dvorak) already fills the width.
         rows += RowModel(
             letters[1].map { it.toString() }.mapIndexed { i, c ->
-                hinted(c, HOME_ROW_SYMBOLS.getOrNull(i))
+                hinted(c, HOME_ROW_SYMBOLS.getOrNull(i), showHint = false)
             },
             edgePadding = if (letters[1].length < 10) 0.05f else 0f
         )
@@ -205,7 +211,7 @@ object KeyboardLayouts {
             buildList {
                 add(Key("", "", KeyType.SHIFT, weight = 1.5f, icon = R.drawable.ic_shift, functional = true))
                 addAll(letters[2].map { it.toString() }.mapIndexed { i, c ->
-                    hinted(c, BOTTOM_ROW_SYMBOLS.getOrNull(i))
+                    hinted(c, BOTTOM_ROW_SYMBOLS.getOrNull(i), showHint = false)
                 })
                 add(Key("", "", KeyType.DELETE, weight = 1.5f, icon = R.drawable.ic_backspace, functional = true))
             }

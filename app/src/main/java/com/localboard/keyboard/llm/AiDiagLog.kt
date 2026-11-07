@@ -41,10 +41,17 @@ object AiDiagLog {
     @Volatile var lastPromptAt: Long = 0L
     @Volatile var lastPromptPurpose: String = ""
 
-    fun recordPrompt(purpose: String, full: String) {
+    /** Shown in place of a prompt that may hold text read from a field that asked not to be remembered. */
+    const val PROMPT_NOT_KEPT = "(not kept: this draft was for a field that asked not to be remembered)"
+
+    fun recordPrompt(purpose: String, full: String, keep: Boolean = true) {
         lastPromptPurpose = purpose
         lastPromptAt = System.currentTimeMillis()
-        lastPrompt = if (full.length > 3000) "…" + full.takeLast(3000) else full
+        lastPrompt = when {
+            !keep -> PROMPT_NOT_KEPT
+            full.length > 3000 -> "…" + full.takeLast(3000)
+            else -> full
+        }
     }
 
     /** Quick-lane (autocorrect) rolling counters — per-run entries would

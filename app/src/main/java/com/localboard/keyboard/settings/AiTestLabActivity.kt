@@ -9,7 +9,6 @@ import androidx.lifecycle.lifecycleScope
 import com.google.android.material.button.MaterialButton
 import com.localboard.keyboard.R
 import com.localboard.keyboard.context.ContextEngine
-import com.localboard.keyboard.engine.FastEngine
 import com.localboard.keyboard.llm.AiTestLab
 import com.localboard.keyboard.llm.LlamaCppProvider
 import com.localboard.keyboard.util.Prefs
@@ -24,9 +23,7 @@ import kotlinx.coroutines.withContext
 class AiTestLabActivity : AppCompatActivity() {
 
     private val prefs by lazy { Prefs(this) }
-    private val contextEngine by lazy {
-        ContextEngine(applicationContext, FastEngine.shared(applicationContext))
-    }
+    private val contextEngine by lazy { ContextEngine.shared(applicationContext) }
     private val provider by lazy { LlamaCppProvider(applicationContext) }
 
     private lateinit var body: TextView

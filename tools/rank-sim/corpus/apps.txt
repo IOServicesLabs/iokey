@@ -1,0 +1,146 @@
+# Invented for this simulator, no real messages. Written before the first run of the
+# rule in src/RankSim.kt and never edited after it: a change means new seeds.
+#
+# The topical app model. Each section is what one person writes about in one app, so
+# the words a section repeats can hold places in that app's row beside everyday words.
+# =name starts a section, @slot: a|b|c lists the entries {slot} may pick, and every
+# other line is one message. How often a line or an entry comes up depends on the seed,
+# as in templates.txt, and which sections the three apps get depends on the seed too.
+=crew
+@crew_item: ticket|deploy|rollout|sprint|backlog|dashboard|pipeline|release|invoice|budget|roadmap|contract
+@crew_who: client|vendor|manager|contractor|intern|auditor|designer
+@crew_when: before standup|after standup|by end of day|before the demo|after the demo|by friday
+the {crew_item} is blocked until the {crew_who} signs off
+can you update the {crew_item} {crew_when}
+i pushed the {crew_item} {crew_when}
+the {crew_who} wants the {crew_item} {crew_when}
+who owns the {crew_item} this sprint
+let's move the {crew_item} to next sprint
+the {crew_item} slipped again
+i need the {crew_who} to review the {crew_item}
+did the {crew_who} approve the {crew_item}
+the {crew_who} has questions about the {crew_item}
+please add the {crew_item} to the agenda
+the agenda for standup is the {crew_item}
+i'm blocked on the {crew_item}
+are you blocked on the {crew_item}
+we shipped the {crew_item} {crew_when}
+we should escalate the {crew_item} to the {crew_who}
+the demo went well but the {crew_item} needs work
+can we sync on the {crew_item} {crew_when}
+let's sync with the {crew_who} {crew_when}
+i'll ping the {crew_who} about the {crew_item}
+the {crew_who} pinged me about the {crew_item}
+send the {crew_who} the latest {crew_item}
+the latest {crew_item} looks good to me
+i left comments on the {crew_item}
+standup is moved because of the demo
+the demo is {crew_when}
+the sprint review is {crew_when}
+the {crew_who} is out so the {crew_item} waits
+i'm reviewing the {crew_item} now
+can you take the {crew_item} while i handle the {crew_who}
+the {crew_who} rejected the {crew_item} so we need another pass
+we need another pass on the {crew_item}
+=house
+@house_item: faucet|furnace|gutters|fence|driveway|dishwasher|roof|thermostat|drywall|deck|water heater|basement
+@house_who: plumber|electrician|landlord|roofer|inspector|handyman
+@house_when: next tuesday|next thursday|first thing monday|before winter|before the rain|once the permit clears
+the {house_who} is coming to fix the {house_item} {house_when}
+the {house_item} is leaking again
+the {house_item} started leaking {house_when}
+did the {house_who} look at the {house_item}
+the {house_who} quoted way too much for the {house_item}
+we got a quote for the {house_item}
+i got another quote from the {house_who}
+can you call the {house_who} about the {house_item}
+i called the {house_who} about the {house_item}
+the {house_who} can't come until {house_when}
+we should replace the {house_item} {house_when}
+we need a permit for the {house_item}
+the permit for the {house_item} finally cleared
+the {house_item} passed inspection
+the {house_item} failed inspection so the {house_who} is coming back
+the inspector wants to see the {house_item}
+i'm saving the receipts for the {house_item}
+the warranty on the {house_item} ran out
+is the {house_item} under warranty
+how much did the {house_item} end up costing
+the {house_item} cost more than the quote
+i measured the {house_item} and it won't fit
+i found mold behind the {house_item}
+the {house_who} found mold near the {house_item}
+leave the key out for the {house_who}
+the {house_who} left a mess around the {house_item}
+tell the {house_who} the {house_item} still isn't working
+the {house_item} is finally working
+i'm painting near the {house_item} {house_when}
+we're still waiting on the {house_who}
+=guild
+@guild_item: raid|dungeon|boss|quest|loot|patch|ladder match|lobby|server|tournament|healer|tank
+@guild_who: guild leader|new recruit|our healer|our tank|the whole squad|the other team
+@guild_when: after reset|after the patch|this season|before reset|once everyone logs in|after the tournament
+who's up for the {guild_item} {guild_when}
+are you joining the {guild_item} {guild_when}
+we need a {guild_item} for the {guild_item}
+{guild_who} wiped us on the {guild_item}
+{guild_who} carried the whole {guild_item}
+the {guild_item} is broken {guild_when}
+the {guild_item} got nerfed {guild_when}
+the {guild_item} got buffed {guild_when}
+i'm stuck on the {guild_item}
+i finally beat the {guild_item}
+the {guild_item} dropped nothing again
+save your gold for the {guild_item}
+i'm farming gold for the {guild_item}
+i'm queueing for the {guild_item} now
+invite me to the {guild_item}
+invite {guild_who} to the lobby
+the lobby is full so wait for the {guild_item}
+log in for the {guild_item} {guild_when}
+{guild_who} needs to log in
+{guild_who} rage quit the {guild_item}
+my ping is awful on this server
+the server keeps lagging during the {guild_item}
+did you see the patch notes for the {guild_item}
+the patch notes say the {guild_item} changed
+we respawn after the {guild_item}
+don't pull the {guild_item} until {guild_who} is ready
+wait for {guild_who} before the {guild_item}
+gg that {guild_item} was close
+one more {guild_item} before i log off
+i'm logging off after this {guild_item}
+=trail
+@trail_item: long run|tempo run|hill repeats|recovery run|trail race|half marathon|track session|group ride|brick workout|taper week
+@trail_gear: shoes|watch|hydration vest|headlamp|bike|wetsuit|knee brace|foam roller
+@trail_when: at sunrise|before work|on saturday morning|after the taper|once my knee heals|next training block
+who's in for the {trail_item} {trail_when}
+are you doing the {trail_item} {trail_when}
+i'm doing the {trail_item} {trail_when}
+my {trail_gear} died during the {trail_item}
+i need new {trail_gear} before the {trail_item}
+i finally replaced my {trail_gear}
+my knee flared up during the {trail_item}
+my knee is sore after the {trail_item}
+the {trail_item} wrecked my legs
+my legs are dead from the {trail_item}
+how was your pace on the {trail_item}
+my pace dropped on the {trail_item}
+i hit a new personal best on the {trail_item}
+the coach moved the {trail_item} to {trail_when}
+the coach wants us at the trailhead {trail_when}
+meet at the trailhead {trail_when}
+the trailhead parking fills up {trail_when}
+bring your {trail_gear} to the trailhead
+don't forget your {trail_gear} for the {trail_item}
+the course for the {trail_item} is hilly
+the {trail_item} course has so much elevation
+i signed up for the {trail_item}
+did you sign up for the {trail_item}
+registration for the {trail_item} closes soon
+i'm tapering for the {trail_item}
+i'm skipping the {trail_item} because of my knee
+my training plan has the {trail_item} {trail_when}
+my training plan says rest {trail_when}
+i stretched and foam rolled after the {trail_item}
+save your legs for the {trail_item}

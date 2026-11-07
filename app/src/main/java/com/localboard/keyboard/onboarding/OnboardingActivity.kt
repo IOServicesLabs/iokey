@@ -18,7 +18,6 @@ import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
 import com.localboard.keyboard.R
 import com.localboard.keyboard.context.ContextEngine
-import com.localboard.keyboard.engine.FastEngine
 import com.localboard.keyboard.settings.SettingsActivity
 import com.localboard.keyboard.util.ImeStatus
 import com.localboard.keyboard.util.Prefs
@@ -246,7 +245,7 @@ class OnboardingActivity : AppCompatActivity() {
     private suspend fun buildModel(corpus: String) {
         try {
             updateStatus(getString(R.string.onb_analyzing), 25)
-            val engine = ContextEngine(applicationContext, FastEngine.shared(applicationContext))
+            val engine = ContextEngine.shared(applicationContext)
             withContext(Dispatchers.IO) { engine.initialize() }
 
             updateStatus(getString(R.string.onb_building), 55)

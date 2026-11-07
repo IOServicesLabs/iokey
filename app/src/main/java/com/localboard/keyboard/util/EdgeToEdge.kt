@@ -37,9 +37,9 @@ object EdgeToEdge {
         app.registerActivityLifecycleCallbacks(
             object : Application.ActivityLifecycleCallbacks {
                 override fun onActivityCreated(activity: Activity, state: Bundle?) {
-                    // Runs after the activity's own onCreate has returned, so
-                    // setContentView has already happened and there is a real
-                    // content view to attach to.
+                    // Runs from inside Activity.onCreate, before the activity's
+                    // own setContentView. The content frame already exists, and
+                    // padding it still moves whatever is later placed inside.
                     apply(activity)
                 }
 
@@ -88,14 +88,17 @@ object EdgeToEdge {
                 WindowInsetsCompat.Type.systemBars() or
                     WindowInsetsCompat.Type.displayCutout()
             )
-            // The IME inset is deliberately NOT consumed here. These screens
-            // scroll, and letting the keyboard overlap a scrolling view is the
-            // normal Android behaviour; consuming it would fight the resize.
+            // With decor fitting off, nothing resizes these screens for the
+            // keyboard: it just covers the bottom of the window, and a focused
+            // field or a Next button can sit behind it with no way to scroll to
+            // it. Padding by the larger of the two lifts the content clear; the
+            // keyboard's inset already includes the navigation bar it sits on.
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
             view.updatePadding(
                 left = bars.left,
                 top = bars.top,
                 right = bars.right,
-                bottom = bars.bottom
+                bottom = maxOf(bars.bottom, ime.bottom)
             )
             // Return the insets unconsumed so any child that cares still sees
             // them — consuming here would silently break a future screen.

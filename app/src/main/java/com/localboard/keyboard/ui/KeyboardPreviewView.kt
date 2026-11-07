@@ -75,7 +75,7 @@ class KeyboardPreviewView @JvmOverloads constructor(
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val w = MeasureSpec.getSize(widthMeasureSpec)
-        val keyH = dp(38 * heightScale)
+        val keyH = dp(27 * heightScale)
         val rowCount = if (showNumberRow) 5 else 4
         val h = (keyH * rowCount + dp(5f) * (rowCount - 1) + dp(16f) + dp(34f)).toInt()
         setMeasuredDimension(w, resolveSize(h, heightMeasureSpec))
@@ -114,7 +114,7 @@ class KeyboardPreviewView @JvmOverloads constructor(
         val top = barH + dp(8f)
         val rowGap = dp(5f)
         val side = dp(4f)
-        val keyH = dp(38 * heightScale)
+        val keyH = dp(27 * heightScale)
         val gap = dp(3.5f)
 
         val rows = buildList {

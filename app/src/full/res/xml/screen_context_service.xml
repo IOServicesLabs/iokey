@@ -2,10 +2,13 @@
 <!-- Optional, off by default: the user enables it in system Accessibility
      settings. Lets the AI read the conversation that is VISIBLE on screen
      (both sides of a chat), which the input connection alone can never see.
-     Text is held in memory only, never written to disk. -->
+     What it reads is held in memory, not written to disk. The chat's title is
+     the exception: it names the conversation in the per-chat word lists, the
+     typing log and the notes built from them, all on this device. -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds"
     android:canRetrieveWindowContent="true"
     android:notificationTimeout="1200"
     android:description="@string/screen_context_service_desc" />

@@ -4,38 +4,220 @@ import android.content.Context
 import androidx.room.withTransaction
 import com.localboard.keyboard.data.db.AppContextEntity
 import com.localboard.keyboard.data.db.AppDatabase
+import com.localboard.keyboard.data.db.LegacyVerdictMigration
 import com.localboard.keyboard.data.db.NGramEntity
+import com.localboard.keyboard.data.db.NGramQueue
+import com.localboard.keyboard.data.db.NGramRows
 import com.localboard.keyboard.data.db.StyleStatEntity
+import com.localboard.keyboard.data.db.applyBatch
 import com.localboard.keyboard.engine.FastEngine
+import com.localboard.keyboard.engine.correction.LegacyTypoVerdicts
+import com.localboard.keyboard.engine.correction.RejectionMemory
+import com.localboard.keyboard.llm.AiDiagLog
+import com.localboard.keyboard.util.TypingDispatcher
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 
 /**
  * The privacy context engine. Everything the keyboard learns flows through
  * here, gets batched in memory, and is persisted to the encrypted database.
- * Nothing ever leaves the device — the app holds no internet permission.
+ * Nothing learned here is sent anywhere. The app does hold the internet
+ * permission, which IOKey uses to download the models the user chooses.
  */
-class ContextEngine(
+class ContextEngine private constructor(
     context: Context,
     private val fastEngine: FastEngine
 ) {
     private val appContext = context.applicationContext
-    private val db by lazy { AppDatabase.get(appContext) }
+    // Asked for each time: the store can be replaced while this engine lives. See [startFresh].
+    private val db get() = AppDatabase.get(appContext)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val prefs by lazy { com.localboard.keyboard.util.Prefs(appContext) }
     private val typingLog by lazy { TypingLog(appContext) }
 
-    /** False when the encrypted store couldn't initialize on this device.
-     *  The keyboard keeps working entirely in memory; nothing crashes. */
+    /** False when the store would not open on this device, which is also what a
+     *  failed migration looks like. The keyboard keeps working in memory, what it
+     *  would have written waits in the queues, and the open is tried again: see
+     *  [retryStoreIfDue]. Nothing crashes. A write that fails later does not set
+     *  this: it is retried. */
     @Volatile
     var persistenceAvailable = true
         private set
+
+    private val health = StorageHealth(remembered = PrefsStoreFailureMemory(appContext))
+
+    /** What is wrong with the store, in plain words, or null when nothing is. */
+    val storageProblem: String? get() = health.problem()
+
+    /** What the person can do about a store that will not open. */
+    val storeAdvice: StoreAdvice get() = health.advice()
+
+    /** What the keyboard has to tell the person about the store, once. See [storeNoticeShown]. */
+    fun storeNoticeDue(): StoreAdvice? = health.noticeDue()
+
+    fun storeNoticeShown() = health.noticeShown()
+
+    private val storedRows = StoredRowGuard(
+        setOf(
+            CONFIRMED_WORDS_KEY, REMOVED_WORDS_KEY, PROFILE_KEY,
+            LegacyTypoVerdicts.SUPPRESSIONS_KEY, LegacyTypoVerdicts.STRIKES_KEY
+        )
+    )
+
+    /** False while memory holds only what was typed since this start, because the store would not
+     *  open or its rows would not load. A word leaving that memory, or that memory not knowing a
+     *  word, says nothing about the rows the store holds for it. Touching only what this process
+     *  queued is safe then. Deleting a word's rows is not, unless the person asked for it. */
+    @Volatile
+    private var modelHasReadTheTable = false
+
+    /** Words taken off the bar with Remove, which stay out of the dictionary too. A typo
+     *  verdict goes in the same blacklist but leaves a shipped word where it is. */
+    private val removedWords = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** Bumped under [writeLock] by every erase. See [unlessErasedSince]. */
+    @Volatile
+    var eraseCount = 0
+        private set
+
+    /** Records a failed store operation and arranges another try. A cancelled
+     *  caller is not a broken store: this engine outlives the screen that called
+     *  it, so reading a cancellation as a failure would stop saving for nothing. */
+    private fun storageFailed(t: Throwable) {
+        if (t is CancellationException) throw t
+        val firstInARow = health.failures == 0
+        health.writeFailed(t)
+        android.util.Log.w("ContextEngine", "store failed: ${health.lastError}")
+        if (firstInARow) reportToDiagnostics(STORAGE_DIAG, health.problem())
+        scheduleRetry()
+    }
+
+    /** The first open of this process failed, which is what counts towards offering a way out. */
+    private fun storeWouldNotOpenAtStart(t: Throwable) {
+        if (t is CancellationException) throw t
+        persistenceAvailable = false
+        health.startFailed(t, storageIsShort(), AppDatabase.libraryMissing)
+        android.util.Log.e("ContextEngine", "store would not open", t)
+        reportToDiagnostics(STORAGE_DIAG, health.problem())
+    }
+
+    /** A later try failed too. Nothing new to report, and these keep coming. */
+    private fun storeStillWouldNotOpen(t: Throwable) {
+        if (t is CancellationException) throw t
+        persistenceAvailable = false
+        health.openFailed(t, storageIsShort(), AppDatabase.libraryMissing)
+        android.util.Log.w("ContextEngine", "store still would not open: ${StorageHealth.describe(t)}")
+    }
+
+    /** A full disk does not always say so: not every way of failing to open one comes back as "full". */
+    private fun storageIsShort(): Boolean = appContext.filesDir.usableSpace < LOW_STORAGE_BYTES
+
+    /** Held by whatever may open or move the store, so that a retry can't cross a start fresh or an erase. */
+    private val storeOpenLock = Mutex()
+
+    init {
+        // Every [AppDatabase.get] tries while there is no store, so anyone can be the one who gets
+        // it open. Without this it would sit there healthy while writes wait and Settings offers
+        // to move it.
+        AppDatabase.onStoreOpened = {
+            if (!persistenceAvailable && isInitialized) scope.launch { tryStoreAgain() }
+        }
+    }
+
+    /**
+     * For the keyboard to call when it shows or hides, off whose thread this does its work. Those are
+     * the moments it is known to be alive, and the process often lives long enough for a passing
+     * failure to pass. A try may move aside a store that reads as corrupt, the same as a start would.
+     */
+    fun retryStoreIfDue() {
+        if (persistenceAvailable || !isInitialized) return
+        if (AppDatabase.isOpenOnDisk() || health.takeOpenRetry()) scope.launch { tryStoreAgain() }
+    }
+
+    private suspend fun tryStoreAgain() {
+        storeOpenLock.withLock { tryStoreAgainLocked() }
+    }
+
+    /** True when the store is open after this, with what it holds in memory and what waited for it in the store. */
+    private suspend fun tryStoreAgainLocked(): Boolean {
+        if (persistenceAvailable) return true
+        try {
+            openForUse(AppDatabase.tryAgain(appContext))
+        } catch (t: Throwable) {
+            storeStillWouldNotOpen(t)
+            return false
+        }
+        dropWhatIsNoLongerAllowed()
+        health.storeOpened()
+        persistenceAvailable = true
+        reportToDiagnostics(STORAGE_DIAG, "Saved words opened again.")
+        readStore(merging = true)
+        return true
+    }
+
+    /** All of this was allowed when it was typed, but it can have waited for days. */
+    private fun dropWhatIsNoLongerAllowed() {
+        if (!prefs.learningEnabled) {
+            pendingNgrams.clear()
+            synchronized(pendingLogLines) { pendingLogLines.clear() }
+            synchronized(appVocabDirty) { appVocabDirty.clear() }
+            return
+        }
+        synchronized(pendingLogLines) {
+            pendingLogLines.removeAll { !prefs.typingLogEnabled || !prefs.mayLearnIn(it.appPackage) }
+        }
+        synchronized(appVocabDirty) {
+            appVocabDirty.keys.removeAll { !prefs.mayLearnIn(it.substringBefore('|')) }
+        }
+    }
+
+    /** The first touch of the file is what runs a pending Room migration. */
+    private fun openForUse(store: AppDatabase) {
+        store.openHelper.writableDatabase
+        if (store.openHelper.databaseName == null) {
+            throw IllegalStateException("only a temporary store in memory could be opened")
+        }
+    }
+
+    /** Learning that stops with no sign of why reads as the keyboard being dumb, so a
+     *  store problem goes where a bug report comes from: Settings, Advanced. */
+    private fun reportToDiagnostics(what: String, text: String?) {
+        AiDiagLog.add(
+            AiDiagLog.Entry(
+                at = System.currentTimeMillis(), model = "", purpose = what,
+                promptTokens = 0, reusedTokens = 0, promptMs = 0, genTokens = 0, genMs = 0,
+                finish = -1, note = text.orEmpty()
+            )
+        )
+    }
+
+    private var retryJob: Job? = null
+
+    /** Keeps trying until a write works, at the pace [health] sets. Anything still
+     *  in a failed batch was put back, and flushing it here means it lands even if
+     *  no one types again. A store that would not open has [retryStoreIfDue], and a
+     *  flush here could never clear that failure. */
+    private fun scheduleRetry() {
+        if (retryJob?.isActive == true) return
+        retryJob = scope.launch {
+            while (persistenceAvailable && health.failures > 0) {
+                delay(health.msUntilRetry().coerceAtLeast(FLUSH_DELAY_MS))
+                flushPending()
+            }
+        }
+    }
 
     @Volatile
     var profile: StyleProfile = StyleProfile.EMPTY
@@ -76,8 +258,8 @@ class ContextEngine(
     // Rolling style refinement
     private val refinement = StyleRefinementEngine()
 
-    // Pending n-gram increments, flushed to DB in batches.
-    private val pendingIncrements = HashMap<Triple<String, String, String>, Int>()
+    // Pending n-gram changes, flushed to DB in batches.
+    private val pendingNgrams = NGramQueue()
     // Committed text awaiting the encrypted typing log (text, app, screen, origin).
     private val pendingLogLines = ArrayList<TypingLog.PendingLine>()
     // Usage-stat deltas accumulated in memory between flushes.
@@ -85,90 +267,237 @@ class ContextEngine(
     private var flushJob: Job? = null
 
     // In-memory per-app vocab, persisted periodically.
-    private val appVocabDirty = HashMap<String, HashMap<String, Int>>()
+    private val appVocabDirty = newestKept<HashMap<String, Int>>(MAX_QUEUED_VOCAB_BUCKETS)
+    // Style-stat rows awaiting the next flush; a later put to a key replaces an earlier one.
+    private val pendingStyleStats = HashMap<String, String>()
+
+    /** Keeps a wipe from interleaving with a batched write to the same tables. */
+    private val writeLock = Mutex()
 
     @Volatile
     var isInitialized = false
         private set
 
+    /** Held for the whole first load. The keyboard and any settings screen can
+     *  ask for it at the same moment, and a second run would reload the model
+     *  the first one just filled. */
+    private val initLock = Mutex()
+
+    private class EarlyLearn(
+        val word: String,
+        val prev1: String,
+        val prev2: String,
+        val appPackage: String,
+        val selected: Boolean
+    )
+
+    /** Words typed before the first load finished, learned when it does. Touched on
+     *  the main thread only, like the service that calls [learnWord]. */
+    private val earlyLearns = ArrayDeque<EarlyLearn>()
+
+    private val dictionaryReady = CompletableDeferred<Unit>()
+    private val firstLoadDone = CompletableDeferred<Unit>()
+
+    /** Returns once the bundled dictionary is in, or has failed to load. */
+    suspend fun awaitDictionary() = dictionaryReady.await()
+
+    /** Returns once the first load is over, with the learned words in if the store gave them up. */
+    suspend fun awaitFirstLoad() = firstLoadDone.await()
+
     // ------------------------------------------------------------------
     // Startup
     // ------------------------------------------------------------------
 
-    suspend fun initialize() = withContext(Dispatchers.IO) {
-        if (isInitialized) return@withContext
+    suspend fun initialize() {
+        if (isInitialized) return
+        initLock.withLock {
+            if (isInitialized) return
+            // The first caller may be a screen. Closing it must not abort a load
+            // the keyboard relies on too.
+            withContext(Dispatchers.IO + NonCancellable) { runFirstLoad() }
+        }
+    }
+
+    private suspend fun runFirstLoad() {
         try {
             fastEngine.loadBaseDictionary()
+            dictionaryReady.complete(Unit)
             // The bigram model rides behind the dictionary on the same IO
             // pass: ~160k entries, a few hundred ms, and every consumer
             // treats "not loaded yet" as context-blind rather than broken.
             fastEngine.loadBaseLanguageModel()
+        } catch (t: Throwable) {
+            // The bundled files, not the store: what was learned can still load.
+            android.util.Log.e("ContextEngine", "dictionary failed to load", t)
+            reportToDiagnostics("dictionary", StorageHealth.describe(t))
+        }
+        dictionaryReady.complete(Unit)
+        loadStore()
+        // Everything that waited for the load runs at the moment it ends, with
+        // nothing able to get in between.
+        withContext(Dispatchers.Main) {
+            isInitialized = true
+            while (earlyLearns.isNotEmpty()) {
+                val e = earlyLearns.removeFirst()
+                learnNow(e.word, e.prev1, e.prev2, e.appPackage, e.selected)
+            }
+        }
+        firstLoadDone.complete(Unit)
+    }
 
-            val ngrams = db.ngramDao()
+    private suspend fun loadStore() {
+        try {
+            openForUse(db)
+        } catch (t: Throwable) {
+            storeWouldNotOpenAtStart(t)
+            return
+        }
+        health.storeOpened()
+        readStore(merging = false)
+    }
+
+    /**
+     * Everything the store holds goes into memory, with whatever memory took in while the store
+     * was closed kept alongside it. With [merging] that has to be saved as well: the queues go to
+     * the store first, since the model load replaces what memory holds with what the table holds.
+     */
+    private suspend fun readStore(merging: Boolean) {
+        AppDatabase.movedAsideBecause?.let {
+            reportToDiagnostics(
+                STORAGE_DIAG,
+                "Saved words could not be read (${StorageHealth.describe(it)}), so the keyboard " +
+                    "moved them aside and started learning again. It did not delete them."
+            )
+        }
+        try {
+            // A failure here is retried at the next start, because its marker is written in
+            // the same transaction. The model can still load in the meantime.
+            db.withTransaction { LegacyVerdictMigration.runOnce(db.ngramDao(), db.styleStatDao()) }
+        } catch (t: Throwable) {
+            storageFailed(t)
+        }
+        try {
             // The n-gram table was append-only: drop stale one-off entries
             // (untouched for 90 days, count <= 1) before they get rehydrated.
-            ngrams.prune(System.currentTimeMillis() - NGRAM_PRUNE_AGE_MS)
-            val unigrams = ngrams.topUnigrams(6000).map { it.word to it.count }
-            val bigrams = ngrams.topBigrams(6000).map { Triple(it.prev1, it.word, it.count) }
-            val trigrams = ngrams.topTrigrams(4000)
-                .map { Triple(it.prev2 to it.prev1, it.word, it.count) }
+            db.ngramDao().prune(System.currentTimeMillis() - NGRAM_PRUNE_AGE_MS)
+        } catch (t: Throwable) {
+            // Only tidying, and no reason to go without what the rows below hold.
+            storageFailed(t)
+        }
+        if (merging) flushPending()
+        try {
             val stats = db.styleStatDao().all().associate { it.key to it.value }
 
-            // A5: typo verdicts must be restored BEFORE the model load —
-            // injectPersonal consults the suppression set, and struck or
-            // suppressed words must not rehydrate into the unigram map.
-            val suppressedRaw = stats["typo_suppressions"]
+            // Typo verdicts must be restored BEFORE the model load — injectPersonal
+            // consults the suppression set, and suppressed words must not rehydrate
+            // into the unigram map.
+            val suppressedRaw = stats[LegacyTypoVerdicts.SUPPRESSIONS_KEY]
                 ?.split(',')?.filter { it.isNotBlank() } ?: emptyList()
-            val strikeEntries = stats["typo_strikes"]
+            val strikeEntries = stats[LegacyTypoVerdicts.STRIKES_KEY]
                 ?.split(',')?.filter { it.isNotBlank() }
                 ?.mapNotNull {
                     val eq = it.indexOf('=')
                     if (eq <= 0) null else it.substring(0, eq) to it.substring(eq + 1)
                 }?.toMap() ?: emptyMap()
-            val confirmedRaw = stats["confirmed_words"]
+            val confirmedRaw = stats[CONFIRMED_WORDS_KEY]
                 ?.split(',')?.filter { it.isNotBlank() } ?: emptyList()
+            val removedRaw = stats[REMOVED_WORDS_KEY]
+                ?.split(',')?.filter { it.isNotBlank() } ?: emptyList()
+            if (merging) settleVerdictsGivenUnread(confirmedRaw)
 
-            // Engine maps are main-thread confined; hydrate on the main thread.
-            withContext(Dispatchers.Main) {
-                fastEngine.restoreSuppressions(suppressedRaw.toSet())
-                fastEngine.restoreStrikes(strikeEntries)
-                fastEngine.restoreConfirmed(confirmedRaw.toSet())
-                // restoreSuppressions only re-arms the blacklist — evict each
-                // still-live suppressed word from trie + userUnigram as well.
-                // removeWordEverywhere re-stamps the verdict with "now", so
-                // restore once more afterwards to keep the ORIGINAL stamps
-                // (otherwise the 30-day TTL would never expire anything).
-                val liveSuppressed = suppressedRaw
+            val liveSuppressed = withContext(Dispatchers.Main) {
+                // At the first load memory holds no verdicts. After a store that was closed it
+                // holds those given meanwhile, which never reached a row: see [StoredRowGuard].
+                val suppressedAll = suppressedRaw + fastEngine.suppressionsSnapshotDated()
+                val removedAll = removedRaw + removedWords
+                fastEngine.restoreSuppressions(suppressedAll.toSet())
+                fastEngine.restoreStrikes(strikeEntries + fastEngine.strikesSnapshot())
+                fastEngine.restoreConfirmed(confirmedRaw.toSet() + fastEngine.confirmedWordsSnapshot())
+                val live = suppressedAll
                     .map { it.substringBefore('@').lowercase() }
                     .filter { fastEngine.isSuppressed(it) }
                     .toSet()
-                liveSuppressed.forEach { fastEngine.removeWordEverywhere(it) }
-                if (liveSuppressed.isNotEmpty()) {
-                    fastEngine.restoreSuppressions(suppressedRaw.toSet())
+                // restoreSuppressions only re-arms the blacklist, which is all a
+                // typo verdict asks for: the rows are kept out of the load below,
+                // and a shipped word stays in the dictionary as noteTypo left it.
+                // A word the user chose to remove leaves the trie as well.
+                // removeWordEverywhere re-stamps the verdict with "now", so
+                // restore once more afterwards to keep the ORIGINAL stamps
+                // (otherwise the 30-day TTL would never expire anything).
+                removedWords.clear()
+                removedAll.filterTo(removedWords) { it in live }
+                removedWords.forEach { fastEngine.removeWordEverywhere(it) }
+                if (removedWords.isNotEmpty()) {
+                    fastEngine.restoreSuppressions(suppressedAll.toSet())
                 }
-                // Strike-1 words and suppressed words stay out of the
-                // rehydrated model — their demotion now survives restarts.
-                val blocked = liveSuppressed + strikeEntries.keys
-                fastEngine.loadUserModel(
-                    unigrams.filter { it.first !in blocked },
-                    bigrams.filter { it.second !in blocked },
-                    trigrams.filter { it.second !in blocked }
-                )
-                stats["profile"]?.let {
-                    profile = StyleProfile.fromJson(it)
-                    refinement.restore(profile)
-                    applyStyleBoosts(profile.toBoostMap())
+                // The profile comes before the model, so that the model failing to
+                // load can't cost it: the rows saved whole are all in memory from here.
+                // Whichever has seen more of this person stays, which at a first load is
+                // always the stored one, and after a closed store nearly always.
+                stats[PROFILE_KEY]?.let {
+                    val stored = StyleProfile.fromJson(it)
+                    if (stored.sentencesAnalyzed >= profile.sentencesAnalyzed) {
+                        profile = stored
+                        refinement.restore(stored)
+                        applyStyleBoosts(stored.toBoostMap())
+                    }
                 }
-                personalityNotes = stats["personality_notes"] ?: ""
-                personaNotes = stats["persona_notes"] ?: ""
+                personalityNotes = stats["personality_notes"] ?: personalityNotes
+                personaNotes = stats["persona_notes"] ?: personaNotes
+                live
             }
+            storedRows.loadRead()
+            // Saves of these rows were refused until now, so what memory added has yet to go in.
+            if (merging) withContext(Dispatchers.Main) { saveWhatMemoryHolds() }
+            // A strike is only a note, so a struck word loads like any other.
+            loadPersonalModel(liveSuppressed)
+
             // The typing log is a rolling window, not an archive.
             typingLog.prune(days = 7)
         } catch (t: Throwable) {
-            // Persistence broken on this device -> in-memory-only mode.
-            persistenceAvailable = false
+            if (t !is CancellationException) health.loadFailed(t)
+            storageFailed(t)
         }
-        isInitialized = true
+    }
+
+    /**
+     * A word struck down twice while memory had not read the table may only have looked like a typo
+     * because memory could not see it was the person's own. Now that can be seen. A word they
+     * confirmed, or use so much that the keyboard would have known it, keeps its rows and loses the
+     * verdict. Any other goes the way it would have gone with the store open.
+     */
+    private suspend fun settleVerdictsGivenUnread(storedConfirmed: List<String>) {
+        // Words the person removed are not in question, and queued their own deletions.
+        val given = fastEngine.suppressionsSnapshot() - removedWords
+        if (given.isEmpty()) return
+        val wellUsed = db.ngramDao().topUnigrams(FastEngine.MAX_PERSONAL_UNIGRAMS)
+            .filter { it.count >= FastEngine.STRONG_USAGE_THRESHOLD }.map { it.word }
+        val theirOwn = given.intersect((storedConfirmed + wellUsed).toSet())
+        withContext(Dispatchers.Main) {
+            theirOwn.forEach { fastEngine.clearTypoVerdict(it) }
+            (given - theirOwn).forEach { deleteStoredWord(it) }
+        }
+    }
+
+    /**
+     * The one way stored rows reach the engine, up to the caps the engine itself keeps, so
+     * that a reload does not cut off what memory would have held. The load runs on the thread
+     * that runs every correction walk and prediction: it inserts into the trie, and none of
+     * them can then be walking it. That is also the cold start's keyboard opening, so it stays
+     * off the main thread.
+     */
+    private suspend fun loadPersonalModel(blocked: Set<String>) {
+        val ngrams = db.ngramDao()
+        val unigrams = ngrams.topUnigrams(FastEngine.MAX_PERSONAL_UNIGRAMS)
+            .filter { it.word !in blocked }.map { it.word to it.count }
+        val bigrams = ngrams.topBigrams(FastEngine.MAX_PERSONAL_BIGRAMS)
+            .filter { it.word !in blocked }.map { Triple(it.prev1, it.word, it.count) }
+        val trigrams = ngrams.topTrigrams(FastEngine.MAX_PERSONAL_TRIGRAMS)
+            .filter { it.word !in blocked }.map { Triple(it.prev2 to it.prev1, it.word, it.count) }
+        withContext(TypingDispatcher.io) {
+            fastEngine.loadUserModel(unigrams, bigrams, trigrams)
+        }
+        modelHasReadTheTable = true
     }
 
     /** A few recent real messages by this person, most recent last — the
@@ -190,9 +519,13 @@ class ContextEngine(
         val screen = if (packageName != null) threadKeyFor(packageName) else ""
         val inThread = if (packageName != null && screen.isNotEmpty()) {
             try {
-                db.typingLogDao().recentForAppAndScreen(packageName, screen, 30)
-                    .map { it.text }.mapNotNull(::clean)
+                // Off the caller's thread, which can be the keyboard's main one. The
+                // first touch of [db] may be what opens the store and migrates it.
+                withContext(Dispatchers.IO) {
+                    db.typingLogDao().recentForAppAndScreen(packageName, screen, 30)
+                }.map { it.text }.mapNotNull(::clean)
             } catch (t: Throwable) {
+                storageFailed(t)
                 emptyList()
             }
         } else emptyList()
@@ -226,8 +559,12 @@ class ContextEngine(
         val screen = threadKeyFor(packageName)
         if (screen.isNotEmpty()) {
             val byScreen = try {
-                db.typingLogDao().recentForAppAndScreen(packageName, screen, 40)
+                // See voiceExamples: this can be the keyboard's main thread.
+                withContext(Dispatchers.IO) {
+                    db.typingLogDao().recentForAppAndScreen(packageName, screen, 40)
+                }
             } catch (t: Throwable) {
+                storageFailed(t)
                 emptyList()
             }
             if (byScreen.isNotEmpty()) {
@@ -246,11 +583,58 @@ class ContextEngine(
     /** Persist new nightly-distilled personality notes. */
     suspend fun setPersonalityNotes(notes: String) {
         personalityNotes = notes
-        if (!persistenceAvailable) return
+        if (!persistenceAvailable) {
+            putStyleStat("personality_notes", notes)
+            return
+        }
         try {
             db.styleStatDao().putAll(listOf(StyleStatEntity("personality_notes", notes)))
         } catch (t: Throwable) {
-            persistenceAvailable = false
+            // The night's work is not repeated until the next night, so it gets retried.
+            putStyleStat("personality_notes", notes)
+            storageFailed(t)
+        }
+    }
+
+    /** The stored value of the style_stats row [key], or null when it has none or
+     *  the store can't be read. Sees a value just handed to [putStyleStat]. */
+    suspend fun styleStat(key: String): String? = writeLock.withLock {
+        synchronized(pendingStyleStats) { pendingStyleStats[key] }
+            ?: withContext(Dispatchers.IO) {
+                if (!persistenceAvailable) {
+                    // Whoever asked now holds none of what is stored, and the store may come back.
+                    storedRows.readFailed(key)
+                    return@withContext null
+                }
+                try {
+                    db.styleStatDao().get(key).also { storedRows.readWorked(key) }
+                } catch (t: Throwable) {
+                    storedRows.readFailed(key)
+                    storageFailed(t)
+                    null
+                }
+            }
+    }
+
+    /** Stores [value] in the style_stats row [key] with the next batched flush,
+     *  so a burst of snapshots costs one write and the last one wins. Safe to
+     *  call on the main thread. The value waits while the store is closed, and is
+     *  dropped when it would replace a row that could not be read: see [StoredRowGuard]. */
+    fun putStyleStat(key: String, value: String) {
+        if (!storedRows.maySave(key)) return
+        synchronized(pendingStyleStats) { pendingStyleStats[key] = value }
+        ensureFlushScheduled()
+    }
+
+    /**
+     * Runs [write] unless an erase has come since [eraseCountBefore], read from [eraseCount] before
+     * reading whatever [write] saves. For slow work outside this class, such as the nightly run,
+     * whose results would otherwise bring erased data back. Under the lock an erase also takes,
+     * so the write has either landed and gets wiped, or never happens.
+     */
+    suspend fun unlessErasedSince(eraseCountBefore: Int, write: suspend (AppDatabase) -> Unit) {
+        writeLock.withLock {
+            if (eraseCount == eraseCountBefore) write(db)
         }
     }
 
@@ -258,18 +642,47 @@ class ContextEngine(
     suspend fun typingLogSnapshot(sinceMs: Long, limit: Int = 400) =
         typingLog.since(sinceMs, limit)
 
-    /** Wipe everything stored for one app (used when it joins the blocklist). */
-    suspend fun eraseAppData(packageName: String) = withContext(Dispatchers.IO) {
-        ScreenBuffer.clear(packageName)  // RAM-only screen captures, if any
-        if (!persistenceAvailable) return@withContext
-        try {
-            db.appContextDao().deleteByPackageAndThreads(packageName)
-            typingLog.clearApp(packageName)
+    /** Wipe everything stored for one app (used when it joins the blocklist).
+     *  Not tied to the caller's lifetime: once asked for, it finishes. The store
+     *  is tried even when [persistenceAvailable] is false, since one failed write
+     *  sets that with all the data still on disk.
+     *
+     *  The copy set aside goes too. It holds this app's rows, and nothing can use it.
+     *
+     *  @return true only when the store on disk was reached and this app's rows
+     *  are gone, and every listener finished. False means data from this app may
+     *  still be on this device, and the caller has to say so. */
+    suspend fun eraseAppData(packageName: String): Boolean =
+        withContext(Dispatchers.IO + NonCancellable) {
+            ScreenBuffer.clear(packageName)  // RAM-only screen captures, if any
             withContext(Dispatchers.Main) { fastEngine.setAppVocab(packageName, emptyMap()) }
-        } catch (t: Throwable) {
-            persistenceAvailable = false
+            val storeWiped = writeLock.withLock {
+                // Under the lock, so a flush has either finished, and its rows get wiped,
+                // or finds nothing of this app's left to write after the wipe.
+                synchronized(pendingLogLines) {
+                    pendingLogLines.removeAll { it.appPackage == packageName }
+                }
+                synchronized(appVocabDirty) {
+                    appVocabDirty.keys.removeAll {
+                        it == packageName || it.startsWith("$packageName|")
+                    }
+                }
+                val rowsGone = try {
+                    db.appContextDao().deleteByPackageAndThreads(packageName)
+                    // Not typingLog.clearApp(), which swallows the failure this has to report.
+                    db.typingLogDao().clearApp(packageName)
+                    // The in-memory fallback has no file name. Emptying it says nothing
+                    // about the file on disk that could not be opened.
+                    db.openHelper.databaseName != null
+                } catch (t: Throwable) {
+                    storageFailed(t)
+                    false
+                }
+                // After the store, since opening it can be what sets it aside.
+                AppDatabase.deleteSetAsideCopy(appContext) && rowsGone
+            }
+            notifyErased(packageName) && storeWiped
         }
-    }
 
     // ------------------------------------------------------------------
     // Learning
@@ -282,7 +695,12 @@ class ContextEngine(
     /** Top learned words by usage count (for the style/dictionary viewer). */
     suspend fun topLearnedWords(limit: Int = 120): List<NGramEntity> = withContext(Dispatchers.IO) {
         if (!persistenceAvailable) emptyList()
-        else try { db.ngramDao().topUnigrams(limit) } catch (t: Throwable) { emptyList() }
+        else try {
+            db.ngramDao().topUnigrams(limit)
+        } catch (t: Throwable) {
+            storageFailed(t)
+            emptyList()
+        }
     }
 
     /** Learned vocabulary as (word, count) for [com.localboard.keyboard.util.BackupManager].
@@ -293,25 +711,61 @@ class ContextEngine(
             if (!persistenceAvailable) emptyList()
             else try {
                 db.ngramDao().topUnigrams(limit).map { it.word to it.count }
-            } catch (_: Throwable) { emptyList() }
+            } catch (t: Throwable) {
+                storageFailed(t)
+                emptyList()
+            }
         }
 
     /** Remove a word from the learned model everywhere, then hot-reload the engine. */
     suspend fun deleteLearnedWord(word: String) = withContext(Dispatchers.IO) {
-        if (!persistenceAvailable) return@withContext
-        try {
-            db.ngramDao().deleteWord(word)
-            val ngrams = db.ngramDao()
-            val unigrams = ngrams.topUnigrams(6000).map { it.word to it.count }
-            val bigrams = ngrams.topBigrams(6000).map { Triple(it.prev1, it.word, it.count) }
-            val trigrams = ngrams.topTrigrams(4000)
-                .map { Triple(it.prev2 to it.prev1, it.word, it.count) }
-            withContext(Dispatchers.Main) {
-                fastEngine.loadUserModel(unigrams, bigrams, trigrams)
-            }
-        } catch (t: Throwable) {
-            // best effort; engine reloads on next app start regardless
+        val w = word.lowercase().trim()
+        forgetRefusal(w)
+        if (!persistenceAvailable) {
+            // Waits with the rest, or the word would come back with the store.
+            deleteStoredWord(w)
+            return@withContext
         }
+        try {
+            deleteStoredWord(w)
+            // The reload replaces what memory holds with what the table holds, so
+            // everything still on its way there has to land first.
+            flushPending()
+            loadPersonalModel(fastEngine.suppressionsSnapshot() + w)
+        } catch (t: Throwable) {
+            storageFailed(t)
+        }
+    }
+
+    /** Holds what the user refused about single words outside this class, and has to hear when one goes. */
+    fun interface WordForgottenListener {
+        /** Runs on the main thread. */
+        fun onWordForgotten(word: String)
+    }
+
+    private val wordForgottenListeners = java.util.concurrent.CopyOnWriteArraySet<WordForgottenListener>()
+
+    fun addWordForgottenListener(listener: WordForgottenListener) {
+        wordForgottenListeners.add(listener)
+    }
+
+    /** This engine can outlive whatever registered, so owners with a shorter life must take themselves off. */
+    fun removeWordForgottenListener(listener: WordForgottenListener) {
+        wordForgottenListeners.remove(listener)
+    }
+
+    /** A word the user removed must not stay refused. A running keyboard holds the refusals and writes
+     *  them back itself. With none running, the stored row is the only copy. */
+    private suspend fun forgetRefusal(w: String) {
+        val told = withContext(Dispatchers.Main) {
+            wordForgottenListeners.forEach { it.onWordForgotten(w) }
+            wordForgottenListeners.isNotEmpty()
+        }
+        if (told) return
+        val row = styleStat(RejectionMemory.STYLE_STATS_KEY) ?: return
+        val memory = RejectionMemory(System::currentTimeMillis).also { it.restore(row) }
+        memory.forget(w)
+        if (memory.dirty) putStyleStat(RejectionMemory.STYLE_STATS_KEY, memory.serialize())
     }
 
     fun learnWord(
@@ -321,134 +775,178 @@ class ContextEngine(
         appPackage: String,
         selected: Boolean = false
     ) {
-        if (!isInitialized || isBlocked(appPackage) || !prefs.learningEnabled) return
+        if (isBlocked(appPackage) || !prefs.learningEnabled) return
         val w = word.lowercase().trim()
         if (w.length < 2 || w.any { it.isDigit() }) return
-        // An explicit add can lift an old typo suppression inside learn() —
-        // persist the new snapshot so the word stays re-added after a restart.
+        if (!isInitialized) {
+            // Typed while the first load runs. Dropping these is what makes the first
+            // words after a restart count for nothing.
+            if (earlyLearns.size < EARLY_LEARN_LIMIT) {
+                earlyLearns.addLast(EarlyLearn(w, prev1, prev2, appPackage, selected))
+            }
+            return
+        }
+        learnNow(w, prev1, prev2, appPackage, selected)
+    }
+
+    private fun learnNow(
+        w: String,
+        prev1: String,
+        prev2: String,
+        appPackage: String,
+        selected: Boolean
+    ) {
+        // A learn can lift an old strike or typo suppression: persist the new
+        // snapshot so the word stays re-added after a restart.
+        val hadStrike = fastEngine.hasStrike(w)
         val wasSuppressed = fastEngine.isSuppressed(w)
-        fastEngine.learn(w, prev1, prev2, selected)
-        if (wasSuppressed && !fastEngine.isSuppressed(w)) persistSuppressions()
-        queuePersist(prev1.lowercase(), prev2.lowercase(), w)
+        val counted = fastEngine.learn(w, prev1, prev2, selected)
+        if ((wasSuppressed && !fastEngine.isSuppressed(w)) || (hadStrike && !fastEngine.hasStrike(w))) {
+            persistSuppressions()
+        }
+        if (counted) {
+            pendingNgrams.addLearned(
+                prev1.lowercase(), prev2.lowercase(), w,
+                unigramDelta = if (selected) FastEngine.SELECTION_BOOST else 1
+            )
+        }
         trackAppVocab(appPackage, w)
         incrementUsage("words_learned_total", 1L)
     }
 
-    /** Explicit user intent ("yes, this is my word" — prediction-bar tap,
-     *  undo of a correction). Confirmed words are immune from autocorrect and
-     *  promote into the trie below the high-usage threshold; persisted so the
-     *  immunity survives restarts. */
+    /** Explicit user intent ("yes, this is my word": a prediction-bar tap).
+     *  Undoing a correction does not come here: it protects the word through
+     *  RejectionMemory and confirms nothing. Confirmed words are immune from
+     *  autocorrect and promote into the trie below the high-usage threshold;
+     *  persisted so the immunity survives restarts. */
     fun noteConfirmed(word: String) {
+        // Before the first load the memory holds no verdicts yet, and saving that
+        // empty snapshot would overwrite the ones on disk for good.
+        if (!isInitialized) return
         if (!prefs.learningEnabled || word.length < 2) return
         fastEngine.noteConfirmed(word.lowercase())
         persistConfirmed()
     }
 
+    /** The confirmation of [word] turned out to be a slip: take it back in memory
+     *  and on disk. See [FastEngine.unconfirm] for who may call this. */
+    fun unconfirm(word: String) {
+        if (!isInitialized) return  // See noteConfirmed.
+        fastEngine.unconfirm(word)
+        persistConfirmed()
+    }
+
+    /** The user said [word] is not a typo: lift any strike or blacklist entry in
+     *  memory and on disk. */
+    fun clearTypoVerdict(word: String) {
+        if (!isInitialized) return  // See noteConfirmed.
+        fastEngine.clearTypoVerdict(word)
+        persistSuppressions()
+    }
+
+    // Verdicts travel with the batched flush, so a failed write is retried and a
+    // snapshot can't land after an erase.
     private fun persistConfirmed() {
-        serviceScopeLaunchIO {
-            try {
-                if (persistenceAvailable) {
-                    val snap = fastEngine.confirmedWordsSnapshot()
-                        .toList().takeLast(1000).joinToString(",")
-                    db.styleStatDao().putAll(listOf(
-                        com.localboard.keyboard.data.db.StyleStatEntity(
-                            "confirmed_words", snap
-                        )
-                    ))
-                }
-            } catch (_: Throwable) { }
-        }
+        putStyleStat(
+            CONFIRMED_WORDS_KEY,
+            fastEngine.confirmedWordsSnapshot().toList().takeLast(1000).joinToString(",")
+        )
     }
 
     private fun persistSuppressions() {
-        serviceScopeLaunchIO {
-            try {
-                if (persistenceAvailable) {
-                    // Dated entries ("word@epochMs") so verdicts expire after
-                    // 30 days; legacy bare words in old stores still restore.
-                    val snap = fastEngine.suppressionsSnapshotDated().toList()
-                        .takeLast(500).joinToString(",")
-                    val strikes = fastEngine.strikesSnapshot().entries
-                        .joinToString(",") { "${it.key}=${it.value}" }
-                    db.styleStatDao().putAll(listOf(
-                        com.localboard.keyboard.data.db.StyleStatEntity(
-                            "typo_suppressions", snap
-                        ),
-                        com.localboard.keyboard.data.db.StyleStatEntity(
-                            "typo_strikes", strikes
-                        )
-                    ))
-                }
-            } catch (_: Throwable) { }
-        }
+        // Dated entries ("word@epochMs") so verdicts expire after 30 days.
+        putStyleStat(
+            LegacyTypoVerdicts.SUPPRESSIONS_KEY,
+            fastEngine.suppressionsSnapshotDated().toList().takeLast(500).joinToString(",")
+        )
+        putStyleStat(
+            LegacyTypoVerdicts.STRIKES_KEY,
+            fastEngine.strikesSnapshot().entries.joinToString(",") { "${it.key}=${it.value}" }
+        )
+        // A word back off the blacklist is no longer removed, or a later typo
+        // verdict on it would take it out of the dictionary at the next start.
+        removedWords.retainAll { fastEngine.isSuppressed(it) }
+        putStyleStat(REMOVED_WORDS_KEY, removedWords.joinToString(","))
     }
 
-    /** The user accepted an autocorrection AWAY from [word]. A5: the FIRST
-     *  time this happens the word is only demoted (a strike); n-grams are
-     *  deleted and the word is blacklisted only on the second strike. The
-     *  strike-1 demotion also drops the word's DB unigram row so it survives
-     *  a restart (previously the count rehydrated on the next launch). */
+    /** The user accepted an autocorrection AWAY from [word]. The FIRST time
+     *  this happens is only a note, and nothing stored changes, since a
+     *  correction firing once proves nothing. The second makes it a confirmed
+     *  typo. Nothing is recorded with learning off. */
     fun noteTypo(word: String, appPackage: String) {
-        if (!isInitialized || isBlocked(appPackage)) return
+        if (!isInitialized || isBlocked(appPackage) || !prefs.learningEnabled) return
         val w = word.lowercase().trim()
         if (w.length < 2) return
         fastEngine.noteTypo(w)
         if (fastEngine.isSuppressed(w)) {
-            // Strike 2 = confirmed typo: every n-gram row goes, and the style
-            // engine unlearns the word so its boost stops amplifying a typo.
+            // Confirmed typo: every n-gram row goes, and the style engine
+            // unlearns the word so its boost stops amplifying a typo.
             refinement.removeWord(w)
-            serviceScopeLaunchIO {
-                try {
-                    if (persistenceAvailable) db.ngramDao().deleteWord(w)
-                } catch (_: Throwable) { }
-            }
-        } else {
-            // Strike 1 = demotion: drop only the unigram row; context rows
-            // stay until the verdict is confirmed.
-            serviceScopeLaunchIO {
-                try {
-                    if (persistenceAvailable) db.ngramDao().deleteUnigram(w)
-                } catch (_: Throwable) { }
-            }
+            // Memory that never read the table can't see that this is the person's own word. The
+            // rows wait for [settleVerdictsGivenUnread], which can.
+            if (modelHasReadTheTable) deleteStoredWord(w)
         }
         persistSuppressions()
     }
 
-    private fun serviceScopeLaunchIO(block: suspend () -> Unit) {
-        scope.launch { block() }
+    /** [word]'s stored rows go with the next flush, which also retries it if the
+     *  write fails. Going through the queue is what stops rows on their way to the
+     *  table from landing after the delete and bringing the word back. */
+    private fun deleteStoredWord(word: String) {
+        pendingNgrams.deleteWord(word)
+        ensureFlushScheduled()
+    }
+
+    /** Undo one learned occurrence of [word] in memory and on disk. See
+     *  [FastEngine.unlearnRecent] for why this is not [removeWordEverywhere].
+     *  [prev1] and [prev2] are the words it was learned after. */
+    fun unlearnRecent(word: String, prev1: String = "", prev2: String = "") {
+        val w = word.lowercase().trim()
+        if (w.length < 2) return
+        if (!isInitialized) {
+            // Not learned yet: take the waiting occurrence back instead.
+            val waiting = earlyLearns.indexOfLast { it.word == w }
+            if (waiting >= 0) earlyLearns.removeAt(waiting)
+            return
+        }
+        val p1 = prev1.lowercase()
+        val p2 = prev2.lowercase()
+        // A decrement is only true of a row the engine holds and takes one from,
+        // so these are read before it does.
+        val heldRows = NGramRows.rowsFor(p1, p2, w).filter { (rowPrev1, rowPrev2, _) ->
+            when {
+                rowPrev1.isEmpty() -> fastEngine.userFrequency(w) > 0
+                rowPrev2.isEmpty() -> fastEngine.bigramRowLower(p1)?.containsKey(w) == true
+                else -> fastEngine.trigramRowLower(p2, p1)?.containsKey(w) == true
+            }
+        }
+        val emptied = fastEngine.unlearnRecent(w, p1, p2)
+        if (emptied && modelHasReadTheTable) {
+            // The word left the model, so its rows leave the table. Decrements would
+            // keep the rows of every other context it was learned in.
+            deleteStoredWord(w)
+        } else if (emptied && !persistenceAvailable) {
+            // Only memory has lost it. With the store closed, all it knew of the word is still in
+            // the queue, and the months of rows behind that must be there when the store returns.
+            pendingNgrams.forgetQueued(w)
+        } else if (heldRows.isNotEmpty()) {
+            pendingNgrams.takeBack(heldRows)
+            ensureFlushScheduled()
+        }
     }
 
     /** P2: the user long-pressed a suggestion and chose Remove. Banishes the
      *  word from the live engine AND its persisted n-gram rows, and marks
      *  it suppressed so predictions stop offering it. Explicit, reversible:
      *  tapping the word in the bar later lifts the suppression. */
-    /** Undo one learned occurrence of [word] in memory and on disk. See
-     *  [FastEngine.unlearnRecent] for why this is not [removeWordEverywhere]. */
-    fun unlearnRecent(word: String) {
-        if (!isInitialized) return
-        val w = word.lowercase().trim()
-        if (w.length < 2) return
-        fastEngine.unlearnRecent(w)
-        // A -1 nets against the +1 that is usually still sitting in the
-        // write-ahead map from the commit a moment ago; otherwise it lands as
-        // a decrement on the stored row.
-        synchronized(pendingIncrements) {
-            pendingIncrements.merge(Triple("", "", w), -1, Int::plus)
-        }
-        ensureFlushScheduled()
-    }
-
     fun removeWordEverywhere(word: String) {
         if (!isInitialized) return
         val w = word.lowercase().trim()
         if (w.length < 2) return
         fastEngine.removeWordEverywhere(w)
+        removedWords.add(w)
         refinement.removeWord(w)  // stop style boosts from amplifying it
-        serviceScopeLaunchIO {
-            try {
-                if (persistenceAvailable) db.ngramDao().deleteWord(w)
-            } catch (_: Throwable) { }
-        }
+        deleteStoredWord(w)
         persistSuppressions()
     }
 
@@ -468,9 +966,8 @@ class ContextEngine(
             var prev2 = ""
             for (w in words) {
                 if (w.length >= 2) {
-                    if (!skipNgramLearn) {
-                        fastEngine.learn(w, prev1, prev2)
-                        queuePersist(prev1, prev2, w)
+                    if (!skipNgramLearn && fastEngine.learn(w, prev1, prev2)) {
+                        pendingNgrams.addLearned(prev1, prev2, w)
                     }
                     trackAppVocab(appPackage, w)
                 }
@@ -504,13 +1001,16 @@ class ContextEngine(
         if (clean.length < 2) return
         // Whole messages are the style engine's real food: multi-word,
         // original-case text (the per-word path corrupted the sentence stats).
-        refineStyle(clean)
+        // An accepted draft is the model's writing, and measuring it would feed
+        // the model's habits back to it as this person's.
+        if (!aiOrigin) refineStyle(clean)
         if (prefs.typingLogEnabled) {
             synchronized(pendingLogLines) {
                 pendingLogLines += TypingLog.PendingLine(
                     clean.take(500), appPackage, threadKey,
                     origin = if (aiOrigin) 1 else 0
                 )
+                keepNewestLogLines()
             }
             ensureFlushScheduled()
         }
@@ -571,17 +1071,21 @@ class ContextEngine(
         // Persist profile + n-grams (best-effort; in-memory model already works)
         if (persistenceAvailable) {
             try {
-                if (updateStyleProfile) {
-                    db.styleStatDao().putAll(listOf(StyleStatEntity("profile", result.profile.toJson())))
-                }
                 val now = System.currentTimeMillis()
-                val entities = ArrayList<NGramEntity>(unigramList.size + bigramList.size + trigramList.size)
-                unigramList.forEach { (w, c) -> entities += NGramEntity("", "", w, c, now) }
-                bigramList.forEach { (p, w, c) -> entities += NGramEntity(p, "", w, c, now) }
-                trigramList.forEach { (pp, w, c) -> entities += NGramEntity(pp.second, pp.first, w, c, now) }
-                entities.chunked(500).forEach { db.ngramDao().upsertAll(it) }
+                // Added to what is stored, as the merge above added to what memory holds.
+                // A restart reads these rows, so anything else is a count that drops then.
+                // All of it or none: a kill part way must not leave half an import behind.
+                db.withTransaction {
+                    if (updateStyleProfile) {
+                        db.styleStatDao().putAll(listOf(StyleStatEntity(PROFILE_KEY, result.profile.toJson())))
+                    }
+                    val ngrams = db.ngramDao()
+                    unigramList.forEach { (w, c) -> ngrams.addCount("", "", w, c, now) }
+                    bigramList.forEach { (p, w, c) -> ngrams.addCount(p, "", w, c, now) }
+                    trigramList.forEach { (pp, w, c) -> ngrams.addCount(pp.second, pp.first, w, c, now) }
+                }
             } catch (t: Throwable) {
-                persistenceAvailable = false
+                storageFailed(t)
             }
         }
 
@@ -615,7 +1119,7 @@ class ContextEngine(
                 // new snapshot so reinstated words survive restarts.
                 persistSuppressions()
             } catch (t: Throwable) {
-                persistenceAvailable = false
+                storageFailed(t)
             }
         }
         promoted.size
@@ -638,7 +1142,7 @@ class ContextEngine(
             // than that buys nothing, so cap at the same frequency scaling.
             val capped = clean.map { (w, c) -> w to c.coerceAtMost(TRIE_FREQ_COUNT_CAP) }
             withContext(Dispatchers.Main) {
-                fastEngine.loadUserModelMerge(capped, emptyList(), emptyList())
+                fastEngine.mergeRestoredCounts(capped)
             }
             if (persistenceAvailable) {
                 try {
@@ -649,7 +1153,7 @@ class ContextEngine(
                         }
                     }
                 } catch (t: Throwable) {
-                    persistenceAvailable = false
+                    storageFailed(t)
                 }
             }
             capped.size
@@ -678,7 +1182,7 @@ class ContextEngine(
                 }
             }
         } catch (t: Throwable) {
-            persistenceAvailable = false
+            storageFailed(t)
         }
     }
 
@@ -687,19 +1191,18 @@ class ContextEngine(
     // ------------------------------------------------------------------
 
     suspend fun dashboardStats(): Map<String, String> = withContext(Dispatchers.IO) {
-        if (!persistenceAvailable) {
-            return@withContext mapOf(
-                "Storage mode" to "In-memory only (device keystore/SQLCipher unavailable)",
+        val rows = if (!persistenceAvailable) {
+            mapOf(
+                "Storage mode" to "In-memory only",
                 "Learned words (this session)" to fastEngine.learnedWordCount.toString(),
                 "Sentences analyzed for style" to profile.sentencesAnalyzed.toString(),
                 "Network permissions held" to "0 (fully offline)"
             )
-        }
-        try {
+        } else try {
             val usage = db.usageStatDao().all().associate { it.key to it.value }
             mapOf(
                 "Storage encryption" to if (AppDatabase.encryptionActive) "SQLCipher AES-256" else "Plain (SQLCipher unavailable)",
-                "Learned words" to db.ngramDao().count().toString(),
+                "Learned words" to db.ngramDao().wordCount().toString(),
                 "Word events processed" to (usage["words_learned_total"] ?: 0L).toString(),
                 "Apps with context profiles" to db.appContextDao().count().toString(),
                 "Sentences analyzed for style" to profile.sentencesAnalyzed.toString(),
@@ -707,50 +1210,213 @@ class ContextEngine(
                 "Network usage" to "Model downloads only (user-initiated); typing never transmitted"
             )
         } catch (t: Throwable) {
-            persistenceAvailable = false
-            mapOf("Storage mode" to "In-memory only (error reading store)")
+            storageFailed(t)
+            mapOf("Storage mode" to "Could not read the store")
         }
+        val problem = storageProblem ?: return@withContext rows
+        rows + ("Storage problem" to problem)
     }
 
-    suspend fun eraseAllLearnedData() = withContext(Dispatchers.IO) {
-        if (persistenceAvailable) {
-            try {
-                db.ngramDao().clear()
-                db.styleStatDao().clear()
-                db.appContextDao().clear()
-                db.usageStatDao().clear()
-                db.distillationDao().clear()
-                typingLog.clear()
-            } catch (t: Throwable) {
-                persistenceAvailable = false
+    /** Holds a copy of learned data outside this class. Without this it would
+     *  write that copy back over an erase the next time it persisted. */
+    fun interface EraseListener {
+        /** Runs on the main thread once the store has been wiped or the wipe has
+         *  failed, because memory has to be dropped either way. [packageName] is
+         *  the one app erased, or null for everything. The erase waits for this,
+         *  so slow work belongs on another dispatcher, and a throw makes
+         *  [eraseAllLearnedData] report that it did not finish. */
+        suspend fun onErased(packageName: String?)
+    }
+
+    private val eraseListeners = java.util.concurrent.CopyOnWriteArraySet<EraseListener>()
+
+    fun addEraseListener(listener: EraseListener) {
+        eraseListeners.add(listener)
+    }
+
+    /** This engine can outlive whatever registered, so owners with a shorter
+     *  life must take themselves off. */
+    fun removeEraseListener(listener: EraseListener) {
+        eraseListeners.remove(listener)
+    }
+
+    /** False when a listener failed. The others still run. */
+    private suspend fun notifyErased(packageName: String?): Boolean =
+        withContext(Dispatchers.Main) {
+            var allFinished = true
+            for (listener in eraseListeners) {
+                try {
+                    listener.onErased(packageName)
+                } catch (t: Throwable) {
+                    allFinished = false
+                    android.util.Log.w(
+                        "ContextEngine", "erase listener failed: ${t.javaClass.simpleName}"
+                    )
+                }
             }
+            allFinished
         }
-        ScreenBuffer.clearAll()
+
+    /** Wipes everything learned, on disk and in memory, then tells the
+     *  [EraseListener]s. Not tied to the caller's lifetime: once asked for, it
+     *  finishes. The store is tried even when [persistenceAvailable] is false,
+     *  since one failed write sets that with all the data still on disk.
+     *
+     *  @return true only when the store on disk was reached and emptied and every
+     *  listener finished. False means personal data may still be on this device,
+     *  and the caller has to say so. */
+    suspend fun eraseAllLearnedData(): Boolean = withContext(Dispatchers.IO + NonCancellable) {
+        // A first load still running would put the old rows back in memory.
+        initialize()
         withContext(Dispatchers.Main) {
             profile = StyleProfile.EMPTY
             personalityNotes = ""
             personaNotes = ""
             refinement.restore(profile)
-            fastEngine.loadUserModel(emptyList(), emptyList(), emptyList())
             applyStyleBoosts(emptyMap())
-            fastEngine.restoreSuppressions(emptySet())
+            earlyLearns.clear()
+            // The last prompt quotes what the user typed.
+            AiDiagLog.lastPrompt = ""
+            AiDiagLog.lastPromptPurpose = ""
+            AiDiagLog.lastPromptAt = 0L
         }
-        synchronized(pendingIncrements) { pendingIncrements.clear() }
-        synchronized(pendingLogLines) { pendingLogLines.clear() }
-        synchronized(usageDeltas) { usageDeltas.clear() }
-        synchronized(appVocabDirty) { appVocabDirty.clear() }
+        withContext(TypingDispatcher.io) { fastEngine.forgetEverythingLearned() }
+        // Everything launched on [scope] is a write on its way to these tables. A
+        // flush or a delayed profile save landing after the wipe would undo it.
+        scope.coroutineContext[Job]?.children?.toList()?.forEach { it.cancelAndJoin() }
+        removedWords.clear()
+        val storeWiped = storeOpenLock.withLock {
+            writeLock.withLock {
+                eraseCount++
+                // Dropped under the lock, so a flush from outside [scope] has either
+                // finished, and its rows get wiped, or finds nothing left to write.
+                pendingNgrams.clear()
+                synchronized(pendingLogLines) { pendingLogLines.clear() }
+                synchronized(usageDeltas) { usageDeltas.clear() }
+                synchronized(appVocabDirty) { appVocabDirty.clear() }
+                synchronized(pendingStyleStats) { pendingStyleStats.clear() }
+                val emptied = wipeStore()
+                // A store that will not open can't be emptied, and it takes no key to delete it.
+                val storeGone = emptied || AppDatabase.deleteStore(appContext)
+                // What was set aside is personal data like the rest, and stays only for as long
+                // as the user wants what they typed kept. After the store, since opening it can
+                // be what sets everything aside.
+                val copyGone = AppDatabase.deleteSetAsideCopy(appContext)
+                if (storeGone && (!emptied || !persistenceAvailable)) newStoreOpens()
+                storeGone && copyGone
+            }
+        }
+        ScreenBuffer.clearAll()
+        notifyErased(null) && storeWiped
+    }
+
+    /** What a tap on Start fresh came to. */
+    enum class StartFreshResult {
+        /** The store opened after all, so nothing moved and every word is back. */
+        NOT_NEEDED,
+
+        /** The old store is out of the way, and saving goes on in a new one. */
+        STARTED_FRESH,
+
+        /** Nothing changed. [storageProblem] says why. */
+        FAILED
+    }
+
+    /**
+     * The user gave up on a store that will not open: it is moved aside, not deleted, and saving
+     * starts again in a new one. It is tried once more first, since whatever made it fail may have
+     * passed, and then every word comes back and nothing has to move. What memory has learned since
+     * the failure goes into the new store. Only ever the user's choice, since a failure can pass and
+     * bring every word back.
+     */
+    suspend fun startFresh(): StartFreshResult = withContext(Dispatchers.IO + NonCancellable) {
+        initialize()
+        storeOpenLock.withLock {
+            // A second dialog, or a retry that got there first.
+            if (persistenceAvailable) return@withLock StartFreshResult.NOT_NEEDED
+            val movedBefore = AppDatabase.movedAsideBecause
+            if (tryStoreAgainLocked()) {
+                // That try may have found the store reads as corrupt and moved it itself.
+                return@withLock if (AppDatabase.movedAsideBecause === movedBefore) {
+                    StartFreshResult.NOT_NEEDED
+                } else StartFreshResult.STARTED_FRESH
+            }
+            try {
+                writeLock.withLock { AppDatabase.startFresh(appContext) }
+            } catch (t: Throwable) {
+                storeStillWouldNotOpen(t)
+                return@withLock StartFreshResult.FAILED
+            }
+            writeLock.withLock { newStoreOpens() }
+            withContext(Dispatchers.Main) { saveWhatMemoryHolds() }
+            ensureFlushScheduled()
+            reportToDiagnostics(STORAGE_DIAG, "Started fresh. Old saved words were moved aside.")
+            StartFreshResult.STARTED_FRESH
+        }
+    }
+
+    /** The store on disk holds nothing now, so whatever was wrong with the old one is over. */
+    private suspend fun newStoreOpens() {
+        try {
+            openForUse(db)
+        } catch (t: Throwable) {
+            storeStillWouldNotOpen(t)
+            return
+        }
+        // It was all allowed when it was typed, and it can have waited for days.
+        dropWhatIsNoLongerAllowed()
+        health.storeReplaced()
+        storedRows.storeEmptied()
+        // An empty store has nothing to overrule what memory decided while it could not read one,
+        // so those words go from what waits to be written, as they would have when judged.
+        if (!modelHasReadTheTable) {
+            (fastEngine.suppressionsSnapshot() - removedWords).forEach { pendingNgrams.deleteWord(it) }
+        }
+        modelHasReadTheTable = true
+        persistenceAvailable = true
+        try {
+            // There are no old verdicts here, and the marker keeps the next start
+            // from taking the new ones for old.
+            db.withTransaction { LegacyVerdictMigration.runOnce(db.ngramDao(), db.styleStatDao()) }
+        } catch (t: Throwable) {
+            storageFailed(t)
+        }
+    }
+
+    /** Saves of rows nobody could read were refused while the store was closed, and these are ones. */
+    private fun saveWhatMemoryHolds() {
+        persistConfirmed()
+        persistSuppressions()
+        if (profile.sentencesAnalyzed > 0) scheduleProfilePersist()
+    }
+
+    private suspend fun wipeStore(): Boolean = try {
+        db.ngramDao().clear()
+        db.styleStatDao().clear()
+        // Says only that the old verdicts are gone, which they are. Without it the
+        // next start would take the verdicts made after this erase for old ones.
+        db.styleStatDao().putAll(listOf(LegacyVerdictMigration.doneRow()))
+        db.appContextDao().clear()
+        db.usageStatDao().clear()
+        db.distillationDao().clear()
+        // Not typingLog.clear(), which swallows the failure this has to report.
+        db.typingLogDao().clear()
+        // Nothing is left that a failed write was trying to save.
+        health.writeWorked()
+        // Nor can a save now replace anything that was never read.
+        storedRows.storeEmptied()
+        modelHasReadTheTable = true
+        // The in-memory fallback has no file name. Emptying it says nothing about
+        // the file on disk that could not be opened.
+        db.openHelper.databaseName != null
+    } catch (t: Throwable) {
+        storageFailed(t)
+        false
     }
 
     // ------------------------------------------------------------------
     // Internals
     // ------------------------------------------------------------------
-
-    private fun queuePersist(prev1: String, prev2: String, word: String) {
-        synchronized(pendingIncrements) {
-            pendingIncrements.merge(Triple(prev1, prev2, word), 1, Int::plus)
-        }
-        ensureFlushScheduled()
-    }
 
     private fun ensureFlushScheduled() {
         if (flushJob?.isActive != true) {
@@ -778,18 +1444,35 @@ class ContextEngine(
         if (!persistenceAvailable) return@withContext
         try {
             flushPending()
-            db.openHelper.writableDatabase.query("PRAGMA wal_checkpoint(PASSIVE)").close()
+            // The cursor has to be stepped: unlike the pragmas that only set something,
+            // this one does its work when run, so preparing and closing it does nothing.
+            db.openHelper.writableDatabase.query("PRAGMA wal_checkpoint(PASSIVE)").use { it.moveToFirst() }
         } catch (_: Throwable) {
             // PASSIVE never blocks a reader; failing is harmless either way.
         }
     }
 
     private suspend fun flushPending() {
-        val batch: Map<Triple<String, String, String>, Int>
-        synchronized(pendingIncrements) {
-            batch = HashMap(pendingIncrements)
-            pendingIncrements.clear()
+        writeLock.withLock { flushPendingLocked() }
+    }
+
+    private suspend fun flushPendingLocked() {
+        if (!persistenceAvailable) {
+            // All of it waits in the queues for [tryStoreAgain]. Only per-app vocabulary has to
+            // reach the live engine meanwhile, which a healthy store does as it writes it, and a
+            // bucket that keeps growing can be handed over whole each time (see persistAppVocab).
+            val waiting = synchronized(appVocabDirty) { appVocabDirty.mapValues { HashMap(it.value) } }
+            for ((key, delta) in waiting) persistAppVocab(key, delta)
+            return
         }
+        // Still backing off from a failed write. [scheduleRetry] comes back for this.
+        if (health.msUntilRetry() > 0L) return
+        val statBatch: List<StyleStatEntity>
+        synchronized(pendingStyleStats) {
+            statBatch = pendingStyleStats.map { StyleStatEntity(it.key, it.value) }
+            pendingStyleStats.clear()
+        }
+        val ngramBatch = pendingNgrams.drain()
         val logBatch: List<TypingLog.PendingLine>
         synchronized(pendingLogLines) {
             logBatch = ArrayList(pendingLogLines)
@@ -807,42 +1490,77 @@ class ContextEngine(
             vocabBatch = appVocabDirty.mapValues { HashMap(it.value) }
             appVocabDirty.clear()
         }
-        if (!persistenceAvailable) {
-            // In-memory mode: still fold app-vocab deltas into the live engine
-            // (persistAppVocab handles the no-DB path itself).
-            for ((key, delta) in vocabBatch) persistAppVocab(key, delta)
-            return
-        }
         try {
             // One Room transaction for the whole flush: each increment used to
             // commit as its OWN SQLCipher transaction (per-key fsync cost).
             db.withTransaction {
-                if (batch.isNotEmpty()) {
-                    val now = System.currentTimeMillis()
-                    val inserts = ArrayList<NGramEntity>(batch.size)
-                    for ((key, delta) in batch) {
-                        // A net-negative delta (an unlearn that outran its
-                        // learn's flush) has nothing to insert.
-                        if (delta == 0) continue
-                        val updated = db.ngramDao().increment(key.first, key.second, key.third, delta, now)
-                        if (delta < 0) continue
-                        if (updated == 0) {
-                            inserts += NGramEntity(key.first, key.second, key.third, delta, now)
-                        }
-                    }
-                    if (inserts.isNotEmpty()) db.ngramDao().upsertAll(inserts)
+                db.ngramDao().applyBatch(ngramBatch, System.currentTimeMillis())
+                for ((key, delta) in usageBatch) {
+                    // Single atomic upsert instead of read-then-write.
+                    db.usageStatDao().addDelta(key, delta)
                 }
-                if (usageBatch.isNotEmpty()) {
-                    for ((key, delta) in usageBatch) {
-                        // Single atomic upsert instead of read-then-write.
-                        db.usageStatDao().addDelta(key, delta)
-                    }
-                }
+                if (statBatch.isNotEmpty()) db.styleStatDao().putAll(statBatch)
             }
-            if (logBatch.isNotEmpty()) typingLog.logAll(logBatch)
-            for ((key, delta) in vocabBatch) persistAppVocab(key, delta)
         } catch (t: Throwable) {
-            persistenceAvailable = false
+            // Rolled back, so none of it landed and all of it goes back in the queue.
+            pendingNgrams.putBack(ngramBatch)
+            synchronized(usageDeltas) {
+                for ((key, delta) in usageBatch) usageDeltas.merge(key, delta, Long::plus)
+            }
+            synchronized(pendingStyleStats) {
+                // A newer value for the key may have arrived since, and it wins.
+                for (stat in statBatch) pendingStyleStats.putIfAbsent(stat.key, stat.value)
+            }
+            putBackLogLines(logBatch)
+            putBackVocab(vocabBatch)
+            storageFailed(t)
+            return
+        }
+        val unwritten = HashMap(vocabBatch)
+        var logWritten = false
+        try {
+            if (logBatch.isNotEmpty()) typingLog.logAll(logBatch)
+            logWritten = true
+            for ((key, delta) in vocabBatch) {
+                persistAppVocab(key, delta)
+                unwritten.remove(key)
+            }
+            if (health.failures > 0) {
+                health.writeWorked()
+                reportToDiagnostics(STORAGE_DIAG, "Saving works again.")
+            }
+        } catch (t: Throwable) {
+            if (!logWritten) putBackLogLines(logBatch)
+            putBackVocab(unwritten)
+            storageFailed(t)
+        }
+    }
+
+    private fun putBackLogLines(lines: List<TypingLog.PendingLine>) {
+        synchronized(pendingLogLines) {
+            pendingLogLines.addAll(0, lines)
+            keepNewestLogLines()
+        }
+    }
+
+    /** Whole messages, and the store may stay down for days. Call this holding [pendingLogLines]. */
+    private fun keepNewestLogLines() {
+        val over = pendingLogLines.size - MAX_PENDING_LOG_LINES
+        if (over > 0) pendingLogLines.subList(0, over).clear()
+    }
+
+    /** A map that drops what was touched longest ago once it holds more than [limit]. */
+    private fun <V> newestKept(limit: Int): HashMap<String, V> =
+        object : LinkedHashMap<String, V>(16, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, V>?) = size > limit
+        }
+
+    private fun putBackVocab(buckets: Map<String, Map<String, Int>>) {
+        synchronized(appVocabDirty) {
+            for ((key, delta) in buckets) {
+                val bucket = appVocabDirty.getOrPut(key) { newestKept(MAX_QUEUED_VOCAB_WORDS) }
+                delta.forEach { (w, c) -> bucket.merge(w, c, Int::plus) }
+            }
         }
     }
 
@@ -854,19 +1572,14 @@ class ContextEngine(
         val thread = ScreenBuffer.currentScreenKey(packageName)
         val keys = if (thread.isNotEmpty())
             listOf(packageName, "$packageName|$thread") else listOf(packageName)
+        // Written with the next flush, under the write lock, which is what keeps it from
+        // landing after an erase. Whoever calls this also schedules that flush.
         synchronized(appVocabDirty) {
-            for (key in keys) {
-                val map = appVocabDirty.getOrPut(key) { HashMap() }
-                map.merge(word, 1, Int::plus)
-                if (map.size >= 40) {
-                    val snapshot = HashMap(map)
-                    map.clear()
-                    scope.launch { persistAppVocab(key, snapshot) }
-                }
-            }
+            for (key in keys) appVocabDirty.getOrPut(key) { newestKept(MAX_QUEUED_VOCAB_WORDS) }.merge(word, 1, Int::plus)
         }
     }
 
+    /** A failure reaches the caller, which still holds [delta] to put back. */
     private suspend fun persistAppVocab(key: String, delta: Map<String, Int>) {
         val bar = key.indexOf('|')
         val basePkg = if (bar > 0) key.substring(0, bar) else key
@@ -880,30 +1593,26 @@ class ContextEngine(
             }
             return
         }
-        try {
-            val existing = db.appContextDao().get(key)
-            val merged = if (existing != null) parseTopWords(existing.topWordsJson) else HashMap()
-            delta.forEach { (w, c) -> merged.merge(w, c, Int::plus) }
-            val top = merged.entries.sortedByDescending { it.value }.take(40)
-            val json = JSONArray(top.map { JSONArray().put(it.key).put(it.value) }).toString()
-            db.appContextDao().put(AppContextEntity(key, json, System.currentTimeMillis()))
-            // P0: bound the table — 40 most recent threads per app, 400 total.
-            if (bar > 0) {
-                db.appContextDao().pruneThreads(basePkg, 40)
-                db.appContextDao().pruneAllThreads(400)
+        val existing = db.appContextDao().get(key)
+        val merged = if (existing != null) parseTopWords(existing.topWordsJson) else HashMap()
+        delta.forEach { (w, c) -> merged.merge(w, c, Int::plus) }
+        val top = merged.entries.sortedByDescending { it.value }.take(40)
+        val json = JSONArray(top.map { JSONArray().put(it.key).put(it.value) }).toString()
+        db.appContextDao().put(AppContextEntity(key, json, System.currentTimeMillis()))
+        // P0: bound the table — 40 most recent threads per app, 400 total.
+        if (bar > 0) {
+            db.appContextDao().pruneThreads(basePkg, 40)
+            db.appContextDao().pruneAllThreads(400)
+        }
+        withContext(Dispatchers.Main) {
+            if (bar < 0) {
+                fastEngine.setAppVocab(basePkg, HashMap(top.associate { it.key to it.value }))
+            } else if (key == "$basePkg|${ScreenBuffer.currentScreenKey(basePkg)}") {
+                // P0: this delta belongs to the conversation on screen —
+                // fold it into the LIVE map (×2, matching loadAppContext)
+                // instead of waiting for an app switch to reload.
+                fastEngine.mergeAppVocab(basePkg, delta, scale = 2)
             }
-            withContext(Dispatchers.Main) {
-                if (bar < 0) {
-                    fastEngine.setAppVocab(basePkg, HashMap(top.associate { it.key to it.value }))
-                } else if (key == "$basePkg|${ScreenBuffer.currentScreenKey(basePkg)}") {
-                    // P0: this delta belongs to the conversation on screen —
-                    // fold it into the LIVE map (×2, matching loadAppContext)
-                    // instead of waiting for an app switch to reload.
-                    fastEngine.mergeAppVocab(basePkg, delta, scale = 2)
-                }
-            }
-        } catch (t: Throwable) {
-            persistenceAvailable = false
         }
     }
 
@@ -924,12 +1633,7 @@ class ContextEngine(
         if (profilePersistJob?.isActive == true) return
         profilePersistJob = scope.launch {
             delay(10_000)
-            if (!persistenceAvailable) return@launch
-            try {
-                db.styleStatDao().putAll(listOf(StyleStatEntity("profile", profile.toJson())))
-            } catch (t: Throwable) {
-                persistenceAvailable = false
-            }
+            putStyleStat(PROFILE_KEY, profile.toJson())
         }
     }
 
@@ -942,6 +1646,19 @@ class ContextEngine(
 
     companion object {
         private const val FLUSH_DELAY_MS = 1_500L
+        /** A few seconds of fast typing while the first load runs. */
+        private const val EARLY_LEARN_LIMIT = 256
+        private const val MAX_PENDING_LOG_LINES = 500
+        /** Only the top 40 words of each bucket get stored, so most of a longer wait never would. */
+        private const val MAX_QUEUED_VOCAB_WORDS = 300
+        /** One per app, and one per conversation in it. */
+        private const val MAX_QUEUED_VOCAB_BUCKETS = 100
+        /** Under this, a failure to open is taken to be about space, whatever it says. */
+        private const val LOW_STORAGE_BYTES = 10L * 1024 * 1024
+        private const val STORAGE_DIAG = "word storage"
+        private const val CONFIRMED_WORDS_KEY = "confirmed_words"
+        private const val REMOVED_WORDS_KEY = "removed_words"
+        private const val PROFILE_KEY = "profile"
         /** N-gram entries untouched for this long with count <= 1 are pruned
          *  at startup (90 days). */
         private const val NGRAM_PRUNE_AGE_MS = 90L * 24 * 60 * 60 * 1000
@@ -955,5 +1672,19 @@ class ContextEngine(
                 "|\\b\\S+?\\.(com|net|org|io|co|app|dev|me|gg|tv|info|biz|ly|link|site)(/\\S*)?\\b",
             RegexOption.IGNORE_CASE
         )
+
+        @Volatile
+        private var sharedInstance: ContextEngine? = null
+
+        /** The one engine for this process. Two engines each reload the shared
+         *  [FastEngine] on their first [initialize], discarding what it learned
+         *  since, and each keep their own copy of the learned data, so an erase
+         *  through one is undone when the other writes its copy back. */
+        fun shared(context: Context): ContextEngine =
+            sharedInstance ?: synchronized(this) {
+                sharedInstance ?: context.applicationContext.let { app ->
+                    ContextEngine(app, FastEngine.shared(app)).also { sharedInstance = it }
+                }
+            }
     }
 }

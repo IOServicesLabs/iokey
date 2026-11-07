@@ -54,6 +54,30 @@ class Prefs(private val context: Context) {
         e.apply()
     }
 
+    /**
+     * What [PrefsMigrations] runs against. One editor and commit(), so a repair is either
+     * wholly on disk or not there at all, and is on disk before anything reads it.
+     */
+    fun migrationStore(): PrefsMigrations.Store = object : PrefsMigrations.Store {
+        override fun snapshot(): Map<String, Any?> = prefs.all
+
+        override fun commit(edit: PrefsMigrations.Edit): Boolean {
+            val e = prefs.edit()
+            edit.remove.forEach { e.remove(it) }
+            edit.putInts.forEach { (key, value) -> e.putInt(key, value) }
+            edit.putBooleans.forEach { (key, value) -> e.putBoolean(key, value) }
+            return e.commit()
+        }
+    }
+
+    /** True once, after an update put keys that had been moved back where they belong.
+     *  Reading it uses it up, so the notice can only ever be shown the one time. */
+    fun takeKeysResetNotice(): Boolean {
+        if (!prefs.getBoolean(PrefsMigrations.KEY_KEYS_RESET_NOTICE, false)) return false
+        prefs.edit().remove(PrefsMigrations.KEY_KEYS_RESET_NOTICE).apply()
+        return true
+    }
+
     enum class Theme { DARK, LIGHT }
 
     var theme: Theme
@@ -129,6 +153,13 @@ class Prefs(private val context: Context) {
         get() = prefs.getString(KEY_SWIPE_BIAS, "") ?: ""
         set(v) = prefs.edit().putString(KEY_SWIPE_BIAS, v).apply()
 
+    /** Settings asked for glide learning to be forgotten. Clearing [swipeBiasData] alone
+     *  is not enough: the running keyboard holds its own copy and would save it back, so
+     *  it clears that copy the next time it shows, and this flag is how it hears. */
+    var swipeBiasResetPending: Boolean
+        get() = prefs.getBoolean(KEY_SWIPE_BIAS_RESET_PENDING, false)
+        set(v) = prefs.edit().putBoolean(KEY_SWIPE_BIAS_RESET_PENDING, v).apply()
+
     // ── Clipboard ────────────────────────────────────────────────────────
 
     /** Keep a short history of copied text, reachable from the bar.
@@ -203,11 +234,6 @@ class Prefs(private val context: Context) {
         set(v) = prefs.edit().putFloat(KEY_ONE_HANDED_W, v.coerceIn(0.6f, 1f)).apply()
 
     // ── Emoji ────────────────────────────────────────────────────────────
-
-    /** Search field at the top of the emoji panel. */
-    var emojiSearch: Boolean
-        get() = prefs.getBoolean(KEY_EMOJI_SEARCH, true)
-        set(v) = prefs.edit().putBoolean(KEY_EMOJI_SEARCH, v).apply()
 
     /** Fitzpatrick skin tone: 0 = default/yellow, 1..5 = light..dark. */
     var emojiSkinTone: Int
@@ -348,30 +374,15 @@ class Prefs(private val context: Context) {
         get() = prefs.getInt(KEY_AC_LEVEL, 2)
         set(v) = prefs.edit().putInt(KEY_AC_LEVEL, v.coerceIn(1, 3)).apply()
 
-    /** Serialized per-key touch offsets (TapLearningModel). */
-    var tapModelData: String
-        get() = prefs.getString(KEY_TAP_MODEL, "") ?: ""
-        set(v) = prefs.edit().putString(KEY_TAP_MODEL, v).apply()
-
     /** Offline voice typing: show the mic button in the suggestion bar. */
     var voiceTypingEnabled: Boolean
         get() = prefs.getBoolean(KEY_VOICE_TYPING, true)
         set(v) = prefs.edit().putBoolean(KEY_VOICE_TYPING, v).apply()
 
-    /** Show the tinkerer rows in settings (manual offsets, experiments). */
+    /** Show the tinkerer rows in settings (engine status, diagnostics). */
     var showAdvanced: Boolean
         get() = prefs.getBoolean(KEY_ADVANCED, false)
         set(v) = prefs.edit().putBoolean(KEY_ADVANCED, v).apply()
-
-    /** Finger-fit calibration: horizontal shift of the whole key grid, in dp. */
-    var keyOffsetXDp: Float
-        get() = prefs.getFloat(KEY_OFFSET_X, 0f)
-        set(v) = prefs.edit().putFloat(KEY_OFFSET_X, v.coerceIn(-60f, 60f)).apply()
-
-    /** Finger-fit calibration: vertical shift of the whole key grid, in dp. */
-    var keyOffsetYDp: Float
-        get() = prefs.getFloat(KEY_OFFSET_Y, 0f)
-        set(v) = prefs.edit().putFloat(KEY_OFFSET_Y, v.coerceIn(-60f, 60f)).apply()
 
     var autoCaps: Boolean
         get() = prefs.getBoolean(KEY_AUTOCAPS, true)
@@ -485,15 +496,22 @@ class Prefs(private val context: Context) {
         prefs.edit().remove(KEY_RECENT_EMOJI).apply()
     }
 
-    /** Factory reset: every preference — learned style, finger-fit
-     *  calibration, offsets, recent emoji, settings — returns to defaults.
-     *  Paired with the database wipe in "erase all data". Downloaded model
-     *  FILES stay on disk (large re-downloads, and not personal data). */
-    fun clearAll() {
-        // commit(), not apply(): the caller wipes the database immediately
-        // after this, and the factory reset must be durably on disk before
-        // that happens — apply() would still be in flight.
-        prefs.edit().clear().commit()
+    /** Factory reset apart from [keys]: every other preference — learned
+     *  style, recent emoji, settings —
+     *  returns to its default. Paired with the database wipe in "erase all
+     *  data", which passes [ERASE_KEEPS]. Downloaded model FILES stay on disk
+     *  (large re-downloads, and not personal data).
+     *
+     *  One editor and one commit: a kept value is never off the disk, so a
+     *  process death part way through cannot turn a switch back to its default.
+     *
+     *  @return false when the reset did not reach the disk. */
+    fun clearAllExcept(keys: Set<String>): Boolean {
+        val edit = prefs.edit()
+        for (key in prefs.all.keys) if (key !in keys) edit.remove(key)
+        // commit(), not apply(): the caller goes on to say the data is gone, and
+        // that has to be true on disk by then — apply() would still be in flight.
+        return edit.commit()
     }
 
     // ------------------------------------------------------------------
@@ -512,6 +530,16 @@ class Prefs(private val context: Context) {
         get() = prefs.getBoolean(KEY_SCREEN_STREAM, true)
         set(v) = prefs.edit().putBoolean(KEY_SCREEN_STREAM, v).apply()
 
+    /** Until this time, by the wall clock, the sparkle does not ask about screen reading. */
+    var screenOfferQuietUntil: Long
+        get() = prefs.getLong(KEY_SCREEN_OFFER_QUIET_UNTIL, 0L)
+        set(v) = prefs.edit().putLong(KEY_SCREEN_OFFER_QUIET_UNTIL, v).apply()
+
+    /** The sparkle never asks about screen reading: "Don't ask again", or a version that cannot do it. */
+    var screenOfferNever: Boolean
+        get() = prefs.getBoolean(KEY_SCREEN_OFFER_NEVER, false)
+        set(v) = prefs.edit().putBoolean(KEY_SCREEN_OFFER_NEVER, v).apply()
+
     /** P5: master switch for the FIELD-TEXT context stream — whether the
      *  text already in the input field may feed AI drafting prompts. */
     var fieldTextEnabled: Boolean
@@ -523,22 +551,9 @@ class Prefs(private val context: Context) {
         get() = prefs.getBoolean(KEY_OVERNIGHT_DISTILL, true)
         set(v) = prefs.edit().putBoolean(KEY_OVERNIGHT_DISTILL, v).apply()
 
-    /** Opt-in AI next-word predictions (quick lane; default off).
-     *
-     *  Reset to off ONCE by the 1.2 build: the feature had been switched on
-     *  to try, and small-model guesses leading the bar were making the
-     *  ordinary n-gram predictions look worse than they were. It stays
-     *  available; it just has to be chosen again. */
+    /** Opt-in AI next-word predictions (quick lane; default off). */
     var llmSuggestions: Boolean
-        get() {
-            if (!prefs.getBoolean(KEY_LLM_SUGGESTIONS_RESET, false)) {
-                prefs.edit()
-                    .putBoolean(KEY_LLM_SUGGESTIONS, false)
-                    .putBoolean(KEY_LLM_SUGGESTIONS_RESET, true)
-                    .apply()
-            }
-            return prefs.getBoolean(KEY_LLM_SUGGESTIONS, false)
-        }
+        get() = prefs.getBoolean(KEY_LLM_SUGGESTIONS, false)
         set(v) = prefs.edit().putBoolean(KEY_LLM_SUGGESTIONS, v).apply()
 
     /** Packages the user doesn't want ANY context saved from. */
@@ -709,35 +724,6 @@ class Prefs(private val context: Context) {
         get() = prefs.getFloat(KEY_LIVE_BG_INTENSITY, 1f)
         set(v) = prefs.edit().putFloat(KEY_LIVE_BG_INTENSITY, v.coerceIn(0f, 1f)).apply()
 
-    /**
-     * Per-key layout fit from the calibration typing test — "key:dx,dy;…" in
-     * dp, same format as [tapModelData].
-     *
-     * These MOVE THE DRAWN KEYS, where the tap model only moves the hit
-     * target. Baking a fit here clears the tap model, because applying both to
-     * the same measurement would shift a key twice.
-     */
-    var keyFitData: String
-        get() = prefs.getString(KEY_KEY_FIT, "") ?: ""
-        set(v) = prefs.edit().putString(KEY_KEY_FIT, v).apply()
-
-    /** Parsed form of [keyFitData]; empty when the user has never calibrated. */
-    fun keyFitMap(): Map<String, Pair<Float, Float>> {
-        val raw = keyFitData
-        if (raw.isBlank()) return emptyMap()
-        val out = HashMap<String, Pair<Float, Float>>()
-        for (entry in raw.split(';')) {
-            val kv = entry.split(':')
-            if (kv.size != 2 || kv[0].isEmpty()) continue
-            val parts = kv[1].split(',')
-            if (parts.size != 2) continue
-            val dx = parts[0].toFloatOrNull() ?: continue
-            val dy = parts[1].toFloatOrNull() ?: continue
-            out[kv[0]] = dx to dy
-        }
-        return out
-    }
-
     // ── The strip behind the navigation bar ──────────────────────────────
     // API 35+ lays the IME window out edge to edge, so the keys are padded up
     // clear of the navigation bar. Something has to fill what is left or the
@@ -750,7 +736,7 @@ class Prefs(private val context: Context) {
      *  out of the box it should be invisible. */
     var navStripMode: Int
         get() = prefs.getInt(KEY_NAV_STRIP_MODE, 0)
-        set(v) = prefs.edit().putInt(KEY_NAV_STRIP_MODE, v.coerceIn(0, 3)).apply()
+        set(v) = prefs.edit().putInt(KEY_NAV_STRIP_MODE, v.coerceIn(0, 2)).apply()
 
     /** Colour for navStripMode == 1. */
     var navStripColor: Int
@@ -815,6 +801,9 @@ class Prefs(private val context: Context) {
         set(v) = prefs.edit().putString(KEY_CUSTOM_MODELS, v).apply()
 
     companion object {
+        /** Public for [BackupManager]: a request to this install, so it never travels. */
+        const val KEY_SWIPE_BIAS_RESET_PENDING = "swipe_bias_reset_pending"
+
         private const val KEY_NO_LEARN_APPS = "no_learn_apps"
         private const val KEY_NO_SCREEN_APPS = "no_screen_apps"
         private const val KEY_NO_AI_APPS = "no_ai_apps"
@@ -831,7 +820,6 @@ class Prefs(private val context: Context) {
         private const val KEY_LIVE_BG_FPS = "live_bg_fps"
         private const val KEY_LIVE_BG_TYPING = "live_bg_while_typing"
         private const val KEY_LIVE_BG_INTENSITY = "live_bg_intensity"
-        private const val KEY_KEY_FIT = "key_layout_fit"
         private const val KEY_NAV_STRIP_MODE = "nav_strip_mode"
         private const val KEY_NAV_STRIP_COLOR = "nav_strip_color"
         private const val KEY_NAV_STRIP_STYLE = "nav_strip_style"
@@ -855,14 +843,13 @@ class Prefs(private val context: Context) {
         private const val KEY_SWIPE_BIAS = "swipe_bias_data"
         private const val KEY_CLIP_HISTORY = "clipboard_history"
         private const val KEY_CLIP_EXPIRY = "clipboard_expiry_min"
-        private const val KEY_CLIP_ENTRIES = "clipboard_entries"
+        const val KEY_CLIP_ENTRIES = "clipboard_entries" // Public for [BackupManager]: it never travels.
         private const val KEY_SNIPPETS_ON = "snippets_enabled"
         private const val KEY_SNIPPETS = "snippet_data"
         private const val KEY_PER_APP_THEME_ON = "per_app_themes_on"
         private const val KEY_PER_APP_THEMES = "per_app_theme_map"
         private const val KEY_ONE_HANDED = "one_handed_mode"
         private const val KEY_ONE_HANDED_W = "one_handed_width"
-        private const val KEY_EMOJI_SEARCH = "emoji_search"
         private const val KEY_EMOJI_SKIN = "emoji_skin_tone"
         private const val KEY_ACTIVE_THEME = "active_theme_code"
         private const val KEY_SAVED_THEMES = "saved_themes"
@@ -888,11 +875,8 @@ class Prefs(private val context: Context) {
         private const val KEY_LIVE_PREVIEW = "live_swipe_preview"
         private const val KEY_LONGPRESS = "longpress_ms"
         private const val KEY_AC_LEVEL = "autocorrect_level"
-        private const val KEY_TAP_MODEL = "tap_model_data"
         private const val KEY_VOICE_TYPING = "voice_typing_enabled"
         private const val KEY_ADVANCED = "show_advanced"
-        private const val KEY_OFFSET_X = "key_offset_x"
-        private const val KEY_OFFSET_Y = "key_offset_y"
         private const val KEY_AUTOCAPS = "auto_caps"
         private const val KEY_LEARNING = "learning_enabled"
         private const val KEY_ONBOARDING = "onboarding_done"
@@ -915,12 +899,54 @@ class Prefs(private val context: Context) {
         private const val KEY_PRESS_EFFECT = "kb_press_effect"
         private const val KEY_TYPING_LOG = "typing_log_enabled"
         private const val KEY_SCREEN_STREAM = "screen_stream_enabled"
+        private const val KEY_SCREEN_OFFER_QUIET_UNTIL = "screen_offer_quiet_until"
+        private const val KEY_SCREEN_OFFER_NEVER = "screen_offer_never"
         private const val KEY_FIELD_TEXT = "field_text_enabled"
         private const val KEY_OVERNIGHT_DISTILL = "overnight_distillation"
         private const val KEY_LLM_SUGGESTIONS = "llm_suggestions"
-        private const val KEY_LLM_SUGGESTIONS_RESET = "llm_suggestions_reset_v2"
         private const val KEY_BLOCKED_APPS = "context_blocked_apps"
         private const val KEY_ACTIVE_MODEL = "active_model_id"
         private const val KEY_CUSTOM_MODELS = "custom_models_json"
+
+        /** What "erase all data" leaves alone. Erase deletes data and never turns
+         *  collection back on, so every choice about what the keyboard may collect,
+         *  keep, read or reach stays as the person set it, and the defaults, which
+         *  are mostly on, never get a say. A new switch of that kind belongs here. */
+        val ERASE_KEEPS: Set<String> = setOf(
+            // The model files stay, so the list naming the imported ones stays too,
+            // or they could no longer be used or deleted from the app. So does the
+            // choice among them, or a model the person picked sits unused and writing
+            // drops to the basic composer if the default was never downloaded.
+            KEY_CUSTOM_MODELS,
+            KEY_ACTIVE_MODEL,
+            KEY_PROVIDER,
+            KEY_QUICK_MODEL,
+            // Says the repairs have run on this install, which an erase does not undo.
+            // Without it the next start would repair again and take the glide learning
+            // gathered since the erase with it.
+            PrefsMigrations.KEY_GEOMETRY_SCHEMA,
+            // What may be collected, for how long, and what the AI may read of it.
+            KEY_LEARNING,
+            KEY_SWIPE_LEARN,
+            KEY_TYPING_LOG,
+            KEY_SCREEN_STREAM,
+            KEY_FIELD_TEXT,
+            KEY_OVERNIGHT_DISTILL,
+            KEY_LLM_USE_PROFILE,
+            KEY_SCREEN_OFFER_NEVER,
+            KEY_CLIP_HISTORY,
+            KEY_CLIP_EXPIRY,
+            KEY_LEARN_CONTACTS,
+            KEY_VOICE_TYPING,
+            // Per-app rules.
+            KEY_BLOCKED_APPS,
+            KEY_NO_LEARN_APPS,
+            KEY_NO_SCREEN_APPS,
+            KEY_NO_AI_APPS,
+            // How what is kept gets protected, and whether anything can leave.
+            KEY_REDACT_SCREEN,
+            KEY_BIOMETRIC_LOCK,
+            KEY_NETWORK_ALLOWED
+        )
     }
 }

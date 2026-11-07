@@ -4,13 +4,18 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorFilter
 import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.PixelFormat
 import android.graphics.PointF
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.drawable.Drawable
 import android.media.AudioManager
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.AttributeSet
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
@@ -26,6 +31,10 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
 import androidx.customview.widget.ExploreByTouchHelper
 import com.localboard.keyboard.R
+import com.localboard.keyboard.engine.DwellMask
+import com.localboard.keyboard.engine.HitKey
+import com.localboard.keyboard.engine.HitMap
+import com.localboard.keyboard.engine.KeyLayoutMath
 import com.localboard.keyboard.engine.KeyboardGeometry
 import kotlin.math.abs
 import kotlin.math.max
@@ -76,6 +85,9 @@ class KeyboardView @JvmOverloads constructor(
 
     var listener: KeyboardListener? = null
     var swipeEnabled = true
+    /** Gliding would be on but this field does not allow it. Long presses still go by the
+     *  rule for a finger that moves, or a drag could open a popup and type its character. */
+    var glideBlockedHere = false
     var hapticEnabled = true
     var soundEnabled = false
 
@@ -84,8 +96,8 @@ class KeyboardView @JvmOverloads constructor(
      *  master gate — when both are false, feedback() skips everything. */
     val keyFeedback = KeyFeedback(context)
 
-    /** Animation level: 0=off, 1=reduced, 2=full. Drives the press-preview
-     *  pop-in animation and the glide-trail fade speed. */
+    /** Animation level: 0=off, 1=reduced, 2=full. Drives the press effect
+     *  and the glide-trail fade speed. */
     var animLevel = 2
         set(v) { field = v.coerceIn(0, 2); trail?.fadeSpeed = trailFadeSpeed(field) }
 
@@ -94,7 +106,7 @@ class KeyboardView @JvmOverloads constructor(
      *  which builds a fresh trail and must not drop the preference. */
     private fun trailFadeSpeed(level: Int): Float = when (level) { 0 -> 2f; 1 -> 1.4f; else -> 1f }
 
-    /** Key press effect: 0=Lift (grow+accent), 1=Bounce (overshoot wobble),
+    /** Key press effect: 0=Lift (grow+accent), 1=Bounce (bigger grow),
      *  2=Glow (accent halo, no motion), 3=None (static shade). animLevel==0
      *  forces the static shade regardless. */
     var pressEffect = 0
@@ -120,12 +132,7 @@ class KeyboardView @JvmOverloads constructor(
 
     /** Fired on each key press, for decoration that lives outside this view
      *  (the navigation-bar strip) and needs to react to typing. */
-    var onKeyPressed: (() -> Unit)? = null
-
-    /** Floor on how far the layout fit may shrink a key, as a fraction of its
-     *  nominal width. A key that fits the hand but is too narrow to hit is a
-     *  worse keyboard than one that is slightly off-centre. */
-    private val MIN_KEY_FRACTION = 0.55f
+    var onKeyPressed: ((KeyType) -> Unit)? = null
 
     /**
      * Identity of the layout currently applied to THIS view, so the service can
@@ -152,18 +159,21 @@ class KeyboardView @JvmOverloads constructor(
 
     val geometry = KeyboardGeometry()
 
-    // Layout metrics (mutable: user height scale)
-    private var keyHeightPx = dp(56)
-    private var textScale = 1f
+    // What the layout math takes from the settings. Where every key goes is
+    // arithmetic on these and the view's width, so gaps and heights keep no copy
+    // of their own here to drift from it.
+    private var heightScale = 1f
+    private var formFactor = 1f
     // Gaps are user-tunable: tighter gaps mean bigger key faces at the same
     // keyboard height, which is the cheapest possible fix for "cramped".
-    private var keyGap = dp(4.5f)
-    private var rowGap = dp(6)
-    private val sidePadding = dp(3)
-    private val topPadding = dp(8)
-    private val bottomPadding = dp(8)
+    private var keySpacing = 1f
+    private var textScale = 1f
     private var cornerRadius = dp(8).toFloat()
     private val keyRects = ArrayList<KeyRect>()
+
+    /** Who owns each point of the grid. Its keys are in the same order as [keyRects],
+     *  because both are built by the same loop. */
+    private var hitMap: HitMap? = null
 
     // ── One-handed mode ──────────────────────────────────────────────────
     // On a phone the size of an S22 Ultra the far edge of the keyboard is
@@ -175,6 +185,10 @@ class KeyboardView @JvmOverloads constructor(
     /** 0 = full width, 1 = docked right, 2 = docked left. */
     private var oneHandedMode = 0
     private var oneHandedWidth = 0.82f
+
+    /** The tallest this board may be and still fit the screen with everything around it.
+     *  Applied by the next layout: setting it moves nothing by itself. */
+    var maxBoardHeightPx = Int.MAX_VALUE
 
     fun setOneHanded(mode: Int, widthFraction: Float) {
         val m = mode.coerceIn(0, 2)
@@ -194,26 +208,11 @@ class KeyboardView @JvmOverloads constructor(
         setOneHanded(if (oneHandedMode == 1) 2 else 1, oneHandedWidth)
     }
 
-    /** Usable key-grid width after one-handed narrowing. */
-    private fun gridWidth(): Float =
-        if (oneHandedMode == 0) (width - sidePadding * 2).toFloat()
-        else (width - sidePadding * 2) * oneHandedWidth
-
-    /** Left edge of the key grid (the dock gutter goes on the other side). */
-    private fun gridLeft(): Float {
-        if (oneHandedMode == 0) return sidePadding.toFloat()
-        val slack = (width - sidePadding * 2) * (1f - oneHandedWidth)
-        return if (oneHandedMode == 1) sidePadding + slack else sidePadding.toFloat()
-    }
-
     /** Scales the gap between keys. 1.0 = stock 4.5dp; lower = bigger keys. */
     fun setKeySpacing(scale: Float) {
         val s = scale.coerceIn(0.4f, 1.8f)
-        val newKeyGap = dp(4.5f * s)
-        val newRowGap = dp(6f * s)
-        if (newKeyGap == keyGap && newRowGap == rowGap) return
-        keyGap = newKeyGap
-        rowGap = newRowGap
+        if (s == keySpacing) return
+        keySpacing = s
         if (width > 0) computeKeyRects()
         requestLayout()
         invalidate()
@@ -221,19 +220,13 @@ class KeyboardView @JvmOverloads constructor(
 
     /** Scales key height and label text. 1.0 = default. */
     fun setMetrics(heightScale: Float, textScale: Float) {
-        // P3: form-factor adaptation — landscape gets shorter keys (vertical
-        // space is precious there), tablets slightly taller ones.
         val cfg = resources.configuration
-        var formFactor = 1f
-        if (cfg.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE) {
-            formFactor *= 0.85f
-        }
-        if (cfg.smallestScreenWidthDp >= 600) formFactor *= 1.12f
-        // P4: key LABELS scale with the system font size (sp), but key
-        // HEIGHTS didn't — large-text users got clipped labels. Grow the
-        // rows with fontScale, capped so the board still fits.
-        if (cfg.fontScale > 1f) formFactor *= cfg.fontScale.coerceAtMost(1.3f)
-        keyHeightPx = dp(56 * heightScale * formFactor)
+        formFactor = KeyLayoutMath.formFactor(
+            landscape = cfg.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE,
+            smallestWidthDp = cfg.smallestScreenWidthDp,
+            fontScale = cfg.fontScale
+        )
+        this.heightScale = heightScale
         this.textScale = textScale
         if (width > 0) computeKeyRects()
         requestLayout()
@@ -258,20 +251,27 @@ class KeyboardView @JvmOverloads constructor(
     /** Finger left the key grid upward into the suggestion bar mid-glide:
      *  the glide freezes and the bar candidates become drag-selectable. */
     private var barSelectMode = false
+    /** The event time of the finger's latest report during a glide. A still finger sends few moves, so its time
+     *  on a word of the bar can only be read from the report that brought it there and the one at its lift. */
+    var barTouchAt = 0L
+        private set
     /** P2: the current touch is scrubbing the cursor along the space bar —
      *  suppress the space dispatch on finger-up. */
     private var spaceCursorMode = false
     private var spaceCursorLastX = 0f
     /** The only pointer we track; extra fingers never move our coordinates. */
     private var activePointerId = -1
+    /** The latest finger to land during a glide and be ignored, where and when, for that
+     *  glide's lift to judge. -1 when there is none. */
+    private var lateFingerId = -1
+    private var lateFingerX = 0f
+    private var lateFingerY = 0f
+    private var lateFingerAt = 0L
     private var lastSwipeProgressAt = 0L
     /** Raw points from finger-down, so a glide that arms late still starts at
      *  the true gesture origin instead of mid-word. */
     private val pendingPoints = ArrayList<PointF>(40)
-    private var keyOffsetXPx = 0f
-    private var keyOffsetYPx = 0f
     private var pressAnimStart = 0L
-    private var previewShownAt = 0L
     private var releaseAnimKey: KeyRect? = null
     private var releaseAnimStart = 0L
     private var trailEnabled = true
@@ -283,17 +283,13 @@ class KeyboardView @JvmOverloads constructor(
     fun setTrailEnabled(b: Boolean) { trailEnabled = b; invalidate() }
     fun setLongPressMs(ms: Int) { longPressMs = ms.coerceIn(250, 600).toLong() }
 
-    /** Shift the whole key grid (finger-fit calibration), in dp. */
-    fun setKeyOffsets(xDp: Float, yDp: Float) {
-        keyOffsetXPx = dp(xDp).toFloat()
-        keyOffsetYPx = dp(yDp).toFloat()
-        if (width > 0) computeKeyRects()
-        // The Y offset is part of the measured height (see onMeasure).
-        requestLayout()
-        invalidate()
-    }
     private var downX = 0f
     private var downY = 0f
+    private var downAt = 0L
+    private var lastTapCommitAt = 0L
+    /** Twice the touch slop, the floor [swipeActivation] already keeps: past this a held
+     *  key is on its way somewhere, so its long press is off. */
+    private val longPressCancelPx: Float by lazy { ViewConfiguration.get(context).scaledTouchSlop * 2f }
     // Swipe-vs-tap discrimination: fast typists drift between taps, so the
     // glide threshold is deliberately high; shorter gestures always decode
     // back to a plain tap of the starting key (no more eaten letters).
@@ -335,11 +331,24 @@ class KeyboardView @JvmOverloads constructor(
     // Long-press popup
     private var popupWindow: PopupWindow? = null
     private var popupLabels: List<TextView> = emptyList()
+    /** What the popup currently offers, tile order — item 0 is the key's own
+     *  label followed by the key's alternate characters. Kept separately from
+     *  [KeyRect.key.popup] because the displayed list has the plain letter
+     *  prepended. */
+    private var popupItems: List<String> = emptyList()
     private var popupSelected = -1
+
+    /** The finger has left the popup's first item on purpose. A second finger landing
+     *  before that means the popup was a slow tap, so the key itself is what gets typed. */
+    private var popupFingerMoved = false
 
     /** Scratch for getLocationOnScreen — reused; one allocation per MOVE
      *  event during popup drag was coming from these lookups. */
     private val locScratch = IntArray(2)
+
+    /** Second scratch so showPopup can hold the view's and the root's
+     *  screen positions at the same time. */
+    private val rootLocScratch = IntArray(2)
 
     /** Raw screen x/y where the long-press opened, or -1 when no popup is
      *  up. The selection stays on item 0 until the finger moves past
@@ -353,17 +362,56 @@ class KeyboardView @JvmOverloads constructor(
         get() = max(dp(18).toFloat(), geometry.averageKeyWidth * 0.5f)
     private var longPressFired = false
 
-    private val longPressRunnable = Runnable { fireLongPress() }
+    /** Posted on the main thread when the key rects have changed, coalesced so a settings
+     *  change that moves them twice reports the last rects only. Requesting layout from
+     *  here is not needed and nothing should. */
+    var onGeometryReady: (() -> Unit)? = null
+    private var notifiedRectsHash = 0
+    private val geometryReadyTick = Runnable { onGeometryReady?.invoke() }
+
+    /** When the long press under way falls due, and whether a late one has gone to wait for a frame. */
+    private var longPressDueAt = 0L
+    private var longPressAwaitingFrame = false
+
+    /**
+     * A stall on this thread can leave moves queued behind a timer that is by then overdue, and moves are only read at the
+     * next frame. They may be the finger leaving the key, so a late timer looks again once they have been read. It stays
+     * queued meanwhile, so that a move takes it off as it takes off any long press, and it still acts if no frame comes.
+     */
+    private val longPressRunnable: Runnable = object : Runnable {
+        override fun run() {
+            if (!longPressAwaitingFrame && SystemClock.uptimeMillis() - longPressDueAt >= LONG_PRESS_LATE_MS) {
+                longPressAwaitingFrame = true
+                handler.postDelayed(this, LONG_PRESS_FRAME_WAIT_MS)
+                postOnAnimation(longPressAfterFrame)
+            } else {
+                fireLongPress()
+            }
+        }
+    }
+
+    /** Runs after that frame's input, so a finger that really stayed still gets its popup here. */
+    private val longPressAfterFrame = Runnable {
+        if (handler.hasCallbacks(longPressRunnable)) {
+            handler.removeCallbacks(longPressRunnable)
+            fireLongPress()
+        }
+    }
+
     private val deleteRepeatRunnable = object : Runnable {
         override fun run() {
+            // A lift this view never hears, because it was taken off the window or the press
+            // was cancelled, must not leave the repeat eating text nobody can see.
+            if (pressedKey?.key?.type != KeyType.DELETE || !isAttachedToWindow) return
             deleteRepeatCount++
-            if (deleteRepeatCount > 8) {
-                // Held long: accelerate into whole-word deletion.
-                listener?.onWordDelete()
-                handler.postDelayed(this, 110)
-            } else {
+            if (deleteRepeatCount <= 20) {
                 listener?.onKey(KeyType.DELETE)
-                handler.postDelayed(this, 55)
+                handler.postDelayed(this, 50)
+            } else {
+                // Held long: accelerate into whole-word deletion, slowly enough that a
+                // word can be seen going and the finger can stop on the right one.
+                listener?.onWordDelete()
+                handler.postDelayed(this, 180)
             }
         }
     }
@@ -372,16 +420,35 @@ class KeyboardView @JvmOverloads constructor(
         setBackgroundColor(theme.background)
     }
 
-    /** Continuous per-key touch adaptation (owned by the service). */
-    var tapModel: com.localboard.keyboard.util.TapLearningModel? = null
-
-    /** A4: screen-px tap point of the most recent letter dispatch. The IME
+    /** Screen-px tap point of the most recent letter dispatch. The IME
      *  consumes (and nulls) it while building its parallel tap trace. */
     @Volatile
     var lastCharTapPoint: PointF? = null
 
+    /**
+     * True while the letters page is up. The symbols pages, the number pad
+     * and the selection pad all read false — the chrome row above the keys
+     * swaps to toolbar icons off the letters page, and reads this instead of
+     * keeping a page state of its own.
+     */
+    val isLettersPage: Boolean
+        get() = model.isLetters
+
+    /** Fired after [setKeyboard] applies a new model, so the chrome row can
+     *  re-read [isLettersPage] without polling. One subscriber at a time is
+     *  all the layout ever has; a new chrome row detaches the old callback. */
+    var onModelApplied: (() -> Unit)? = null
+
     fun setKeyboard(model: KeyboardModel) {
+        // The view stays attached across a page change, so nothing else ends the touch. A
+        // field restart can change the page under a finger, whose lift would type a key that
+        // has gone. The two touch paths that change the page themselves keep what they need.
+        cancelTouch()
         releaseAnimKey = null
+        // Capture the outgoing page BEFORE the swap so the content area can
+        // crossfade into the new one (see [PageTransition]). No-op when there
+        // is nothing rendered yet or when motion is off.
+        beginPageTransition()
         this.model = model
         // BUGFIX: when the new model has the same row count as the old one,
         // onSizeChanged never fires and key rects were never recomputed —
@@ -390,6 +457,7 @@ class KeyboardView @JvmOverloads constructor(
         // no size yet there is no layer to invalidate.
         if (width > 0 && height > 0) computeKeyRects() else invalidate()
         requestLayout()
+        onModelApplied?.invoke()
     }
 
     fun setTheme(theme: KeyboardTheme) {
@@ -407,19 +475,77 @@ class KeyboardView @JvmOverloads constructor(
 
     fun currentModel(): KeyboardModel = model
 
+    /** System animator duration scale — the "remove animations" accessibility
+     *  setting. 0 (or unreadable) means motion is off: every animation this
+     *  view runs degrades to an instant cut. Read at each animation's start
+     *  (a page change, a popup), never per frame. */
+    private fun animatorScale(): Float {
+        return try {
+            if (android.os.Build.VERSION.SDK_INT >= 17) {
+                android.provider.Settings.Global.getFloat(
+                    context.contentResolver,
+                    android.provider.Settings.Global.ANIMATOR_DURATION_SCALE
+                )
+            } else 1f
+        } catch (_: Throwable) { 1f }
+    }
+
+    /** Snapshot the outgoing page (background + resting grid, straight from
+     *  the cached layers) so [setKeyboard]'s swap can crossfade. Skipped —
+     *  leaving an instant cut — when nothing is rendered yet (the very first
+     *  layout: there is no old frame, and the first swap stays free of extra
+     *  work), when the user's animation level is off, or when the system
+     *  animator scale is 0. */
+    private fun beginPageTransition() {
+        endPageTransition()
+        if (animLevel == 0) return
+        val durationMs = (PAGE_TRANSITION_MS * animatorScale()).toLong()
+        if (durationMs <= 0L) return
+        if (width <= 0 || height <= 0 || keyRects.isEmpty()) return
+        val bg = bgLayer
+        val keys = keysLayer
+        val bgUsable = bg != null && !bg.isRecycled && bg.width == width && bg.height == height
+        val keysUsable = keys != null && !keys.isRecycled && keys.width == width && keys.height == height
+        // A flat theme colour with no layers built yet has nothing worth
+        // capturing; the new page appears instantly, as before this pass.
+        if (!bgUsable && !keysUsable && wallpaper == null) return
+        val bmp = try {
+            android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
+        } catch (_: Throwable) { return }
+        val c = Canvas(bmp)
+        if (bgUsable) c.drawBitmap(bg, 0f, 0f, null)
+        else {
+            // No usable background layer (live background, or a size change
+            // in flight): a flat fill keeps the old page legible enough to
+            // dissolve from.
+            c.drawColor(theme.background)
+        }
+        if (keysUsable) c.drawBitmap(keys, 0f, 0f, null)
+        else for (kr in keyRects) drawKey(c, kr)
+        pageTransition = PageTransition(bmp, SystemClock.uptimeMillis(), durationMs)
+    }
+
+    private fun endPageTransition() {
+        val t = pageTransition ?: return
+        pageTransition = null
+        if (!t.snapshot.isRecycled) t.snapshot.recycle()
+    }
+
+    /** Crossfade progress 0..1 with a fast-out ease; 1 means finished. */
+    private fun pageTransitionAlpha(t: PageTransition): Float {
+        val raw = (SystemClock.uptimeMillis() - t.startAtMs).toFloat() / t.durationMs
+        if (raw >= 1f) return 1f
+        val clamped = raw.coerceIn(0f, 1f)
+        return 1f - (1f - clamped) * (1f - clamped)
+    }
+
     // ---------------------------------------------------------------
     // Layout
     // ---------------------------------------------------------------
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val width = MeasureSpec.getSize(widthMeasureSpec)
-        val rows = model.rows.size
-        // keyOffsetYPx shifts every row down in computeKeyRects(); without
-        // reserving that space here a positive Y calibration pushes the bottom
-        // row past the measured edge, clipping it and deadening its touches.
-        val height = (topPadding + bottomPadding + rows * keyHeightPx +
-            (rows - 1) * rowGap + max(0, keyOffsetYPx.roundToInt()))
-        setMeasuredDimension(width, height)
+        setMeasuredDimension(width, KeyLayoutMath.heightPx(model.rows.size, boardMetrics()))
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -428,84 +554,40 @@ class KeyboardView @JvmOverloads constructor(
     }
 
 
-    /**
-     * Per-key layout fit, in dp, from the calibration typing test: where this
-     * user's finger actually lands relative to each key's nominal centre.
-     *
-     * Unlike [tapModel], which nudges the hit-test target while leaving the
-     * drawn key where it was, this MOVES THE KEY. The two must not both be
-     * applied to the same measurement or the shift lands twice, so baking a
-     * fit into the layout clears the tap model — from then on the model
-     * measures residual drift from the new positions.
-     */
-    var keyFit: Map<String, Pair<Float, Float>> = emptyMap()
-        set(v) { field = v; if (width > 0) computeKeyRects(); invalidate() }
+    private fun layoutMetrics() = KeyLayoutMath.metrics(
+        density = resources.displayMetrics.density,
+        viewWidthPx = width,
+        heightScale = heightScale,
+        formFactor = formFactor,
+        keySpacing = keySpacing,
+        oneHandedMode = oneHandedMode,
+        oneHandedWidth = oneHandedWidth
+    )
 
+    private fun boardMetrics() =
+        KeyLayoutMath.capped(layoutMetrics(), model.rows.size, maxBoardHeightPx, dp(28).toFloat())
+
+    /**
+     * Keys are drawn where the layout math says, and nothing learned about the user's
+     * touch is an input to it. That is the whole promise of a keyboard whose keys stay
+     * put: a key that moves under a finger that has adapted to it is a new source of
+     * typos, and no amount of typing or testing should be able to do that.
+     */
     private fun computeKeyRects() {
         keyRects.clear()
         geometry.clear()
         keyTouchHelper.invalidateRoot()
-        val usableWidth = gridWidth()
-        val originX = gridLeft()
-        var y = topPadding + keyOffsetYPx
-        val density = resources.displayMetrics.density
-        var prevRowBottom = Float.NEGATIVE_INFINITY
-
-        for (row in model.rows) {
-            val totalWeight = row.keys.sumOf { it.weight.toDouble() }.toFloat()
-            val gaps = keyGap * (row.keys.size - 1)
-            val edgePad = usableWidth * row.edgePadding
-            val keyArea = usableWidth - gaps - edgePad * 2
-            val originRowX = originX + edgePad + keyOffsetXPx
-
-            // ── nominal boundaries ────────────────────────────────────────
-            // Laid out first as a list of edges so the fit can move the edges
-            // BETWEEN keys rather than the keys themselves. Nudging each key
-            // independently would open gaps and overlaps; moving the shared
-            // boundary keeps the row exactly tiled while both neighbours'
-            // centres travel toward where the finger lands.
-            val n = row.keys.size
-            val widths = FloatArray(n) { keyArea * (row.keys[it].weight / totalWeight) }
-            val edges = FloatArray(n + 1)
-            edges[0] = originRowX
-            for (i in 0 until n) edges[i + 1] = edges[i] + widths[i] + keyGap
-
-            val fitX = FloatArray(n)
-            var dySum = 0f
-            var dyCount = 0
-            if (keyFit.isNotEmpty()) {
-                for (i in 0 until n) {
-                    val k = row.keys[i]
-                    if (k.type != KeyType.CHAR || k.output.length != 1) continue
-                    val off = keyFit[k.output] ?: continue
-                    fitX[i] = off.first * density
-                    dySum += off.second
-                    dyCount++
-                }
-                // Interior edges only: the row's outer edges stay put so the
-                // keyboard keeps its margins and total width.
-                for (j in 1 until n) {
-                    val shift = (fitX[j - 1] + fitX[j]) / 2f
-                    val lo = edges[j - 1] + widths[j - 1] * MIN_KEY_FRACTION
-                    val hi = edges[j + 1] - widths[j] * MIN_KEY_FRACTION - keyGap
-                    edges[j] = (edges[j] + shift).coerceIn(minOf(lo, hi), maxOf(lo, hi))
-                }
-            }
-
-            // Whole-row vertical fit. Rows move together so the grid still
-            // reads as rows; clamped against the previous row's bottom so a
-            // large offset can never make two rows collide.
-            var rowY = y
-            if (dyCount > 0) {
-                val dy = (dySum / dyCount) * density
-                rowY = (y + dy).coerceAtLeast(prevRowBottom + keyGap)
-            }
-
-            for (i in 0 until n) {
-                val key = row.keys[i]
-                val left = edges[i]
-                val right = edges[i + 1] - keyGap
-                val rect = RectF(left, rowY, right, rowY + keyHeightPx)
+        val metrics = boardMetrics()
+        val boxes = KeyLayoutMath.layout(
+            model.rows.map { row ->
+                KeyLayoutMath.Row(FloatArray(row.keys.size) { row.keys[it].weight }, row.edgePadding)
+            },
+            metrics
+        )
+        val hitRows = model.rows.mapIndexed { r, row ->
+            row.keys.mapIndexed { i, key ->
+                val box = boxes[r][i]
+                val rect = RectF(box.left, box.top, box.right, box.bottom)
                 keyRects += KeyRect(key, rect)
 
                 // Register letters with the geometry for swipe decoding.
@@ -514,16 +596,44 @@ class KeyboardView @JvmOverloads constructor(
                 ) {
                     geometry.register(key.output[0].lowercaseChar(), rect)
                 }
+                HitKey(
+                    HitKey.symbolFor(key.type == KeyType.SPACE, key.type == KeyType.CHAR, key.output),
+                    box.left, box.top, box.right, box.bottom
+                )
             }
-            prevRowBottom = rowY + keyHeightPx
-            y += keyHeightPx + rowGap
         }
+        // Side padding at a screen edge belongs to the edge keys, so a tap beside the grid
+        // there still types: both sides at full width, the docked side one-handed. Only the
+        // side facing the gutter stops at the grid, because past it there is nothing to press.
+        hitMap = HitMap(
+            hitRows,
+            if (oneHandedMode == 1) metrics.originX else 0f,
+            if (oneHandedMode == 2) metrics.originX + metrics.usableWidth else width.toFloat()
+        )
         geometry.finishLayout()
         // Any geometry change invalidates the cached grid. Doing this here
         // rather than at each call site means a new setter that moves keys
         // can't silently leave a stale bitmap on screen — which is exactly
         // the failure mode a render cache invites.
         markLayersDirty()
+        // Folded from the boxes themselves, because a page switch can land on the same
+        // letter layout version with other rects. Posted rather than called: one settings
+        // change runs this several times on in-between rects, and this function can run
+        // inside onSizeChanged, where the callback must not reach layout.
+        var rectsHash = 17
+        for (row in boxes) {
+            for (box in row) {
+                rectsHash = 31 * rectsHash + box.left.toBits()
+                rectsHash = 31 * rectsHash + box.top.toBits()
+                rectsHash = 31 * rectsHash + box.right.toBits()
+                rectsHash = 31 * rectsHash + box.bottom.toBits()
+            }
+        }
+        if (rectsHash != notifiedRectsHash) {
+            notifiedRectsHash = rectsHash
+            handler.removeCallbacks(geometryReadyTick)
+            handler.post(geometryReadyTick)
+        }
     }
 
     // ---------------------------------------------------------------
@@ -566,12 +676,35 @@ class KeyboardView @JvmOverloads constructor(
     /** Scratch for clip queries on the draw path — never allocate per frame. */
     private val clipScratch = android.graphics.Rect()
 
-    /** Drives the press-effect and preview pop-in animations, one key's
-     *  dirty rect at a time. */
+    /** Drives the press-effect animation, one key's dirty rect at a time. */
     private val pressAnimTick = Runnable { invalidateKeyArea(liveKey()) }
 
     /** Drives the trail fade, repainting only where the trail is. */
     private val trailTick = Runnable { invalidateTrailArea() }
+
+    // ── Page-change transition ───────────────────────────────────────────
+    //
+    // Gboard crossfades the key grid when the page changes (?123, ABC, the
+    // number pad). The window still resizes exactly once — only the content
+    // crossfades: the previous page's pixels (captured from the cached
+    // layers before the model swap) sit underneath while the new content
+    // fades in on a layer. The whole thing runs inside onDraw on posted
+    // invalidates, so no part of it ever lands between a touch and its
+    // commit.
+    private class PageTransition(
+        val snapshot: android.graphics.Bitmap,
+        val startAtMs: Long,
+        val durationMs: Long,
+    )
+
+    private var pageTransition: PageTransition? = null
+
+    /** Reused tick + alpha paint: the transition runs ~9 frames and must not
+     *  allocate per frame. */
+    private val pageTransitionTick = Runnable {
+        if (pageTransition != null) invalidate()
+    }
+    private val transitionPaint = Paint(Paint.ANTI_ALIAS_FLAG)
 
     private val trailBounds = RectF()
     private val trailPrevBounds = RectF()
@@ -868,13 +1001,13 @@ class KeyboardView @JvmOverloads constructor(
         // anyway, so just take one.
         if (animatedBgActive() && liveBg.isActive()) { invalidate(); return }
         keyPaintRect(kr, keyAreaScratch)
-        // Superset of the painted region: a margin for antialiasing, plus the
-        // preview bubble that floats above a character key.
+        // Superset of the painted region: a margin for antialiasing. The
+        // press-preview pill floats in the root's ViewOverlay, outside this
+        // view; its host-side dirty rects are handled in syncPressPreview.
         val pad = dp(4).toFloat()
-        val bubble = if (previewEnabled && kr.key.type == KeyType.CHAR) dp(64).toFloat() else 0f
         invalidate(
             (keyAreaScratch.left - pad).toInt() - 1,
-            (keyAreaScratch.top - pad - bubble).toInt() - 1,
+            (keyAreaScratch.top - pad).toInt() - 1,
             (keyAreaScratch.right + pad).toInt() + 1,
             (keyAreaScratch.bottom + pad).toInt() + 1
         )
@@ -922,6 +1055,26 @@ class KeyboardView @JvmOverloads constructor(
             stats.fullRedraws++
         }
 
+        // Page-change crossfade. The old page's snapshot goes down at full
+        // strength; the new content draws into an alpha layer on top. The
+        // window resize that accompanies a page change is untouched — this
+        // animates pixels, not layout.
+        var contentLayer = -1
+        pageTransition?.let { t ->
+            val alpha = pageTransitionAlpha(t)
+            if (alpha >= 1f) {
+                endPageTransition()
+            } else {
+                canvas.drawBitmap(t.snapshot, 0f, 0f, null)
+                transitionPaint.alpha = (alpha * 255).toInt()
+                contentLayer = canvas.saveLayer(
+                    0f, 0f, width.toFloat(), height.toFloat(), transitionPaint
+                )
+                removeCallbacks(pageTransitionTick)
+                postOnAnimation(pageTransitionTick)
+            }
+        }
+
         val wantsBgFrame = drawBackground(canvas)
         if (wantsBgFrame) stats.backgroundFrames++
 
@@ -933,8 +1086,8 @@ class KeyboardView @JvmOverloads constructor(
         val layer = ensureKeysLayer()
 
         // Cut the live key out of the cached grid, then draw it for real. The
-        // cut-out matters: the bounce effect dips BELOW resting size, so a
-        // cached key underneath would peek out around the edges.
+        // cut-out matters: the cached key is the resting colour, and it would
+        // otherwise peek out around the edges of any effect that does not cover it.
         fun blitGrid() {
             if (layer != null && !layer.isRecycled) canvas.drawBitmap(layer, 0f, 0f, layerPaint)
             else for (kr in keyRects) drawKey(canvas, kr)
@@ -953,11 +1106,12 @@ class KeyboardView @JvmOverloads constructor(
         } else {
             blitGrid()
         }
+        if (contentLayer >= 0) canvas.restoreToCount(contentLayer)
 
         // Press animation keeps asking for frames, but only over the key's own
         // dirty rect — this used to repaint the entire grid at 60 fps.
         if (effectivePressEffect != 3 &&
-            ((pressedKey != null && System.currentTimeMillis() - pressAnimStart < 140) ||
+            ((pressedKey != null && System.currentTimeMillis() - pressAnimStart < PRESS_ANIM_MS) ||
                 releaseAnimKey != null)
         ) {
             // Reused Runnable: a lambda here would allocate once per animation
@@ -966,12 +1120,11 @@ class KeyboardView @JvmOverloads constructor(
             postDelayed(pressAnimTick, 16)
         }
 
-        // Press preview bubble above the tapped character key.
-        pressedKey?.let { kr ->
-            if (previewEnabled && !isSwiping && kr.key.type == KeyType.CHAR && !longPressFired) {
-                drawPressPreview(canvas, kr)
-            }
-        }
+        // Press preview pill above the tapped character key. It lives in the
+        // window root's ViewOverlay (see syncPressPreview), not in this
+        // canvas: on the top row the pill hangs over the bar, outside this
+        // view's bounds.
+        syncPressPreview()
 
         // Glide trail. Repaints its own region rather than the whole keyboard:
         // during a glide this ran at animation rate with a full-view invalidate
@@ -998,7 +1151,8 @@ class KeyboardView @JvmOverloads constructor(
 
         // Press feedback — four selectable effects (see Prefs.pressEffect).
         // Lift: slight grow with an accent lift, eased back on release.
-        // Bounce: bigger overshoot with a wobble that settles on release.
+        // Bounce: bigger grow, eased back on release. A wobble would only flicker in the
+        // few frames a key now has.
         // Glow: no motion, accent halo ring + stronger tint.
         // None: static darker shade, zero animation frames (cheapest).
         val now = System.currentTimeMillis()
@@ -1016,38 +1170,36 @@ class KeyboardView @JvmOverloads constructor(
             }
             1 -> { // bounce
                 if (pressed) {
-                    val t = ((now - pressAnimStart) / 110f).coerceIn(0f, 1f)
+                    val t = ((now - pressAnimStart) / PRESS_ANIM_MS).coerceIn(0f, 1f)
                     scale = 1f + 0.09f * t
                     lift = t * 0.7f
                 } else if (releaseAnimKey === kr) {
-                    val t = ((now - releaseAnimStart) / 240f).coerceIn(0f, 1f)
+                    val t = ((now - releaseAnimStart) / PRESS_ANIM_MS).coerceIn(0f, 1f)
                     if (t >= 1f) {
                         releaseAnimKey = null
                     } else {
-                        // damped wobble: overshoots, dips below 1, settles
-                        val decay = (1f - t) * (1f - t)
-                        scale = 1f + 0.09f * decay *
-                            kotlin.math.cos((t * 2.5f * Math.PI).toFloat())
-                        lift = decay * 0.5f
+                        val ease = (1f - t) * (1f - t)
+                        scale = 1f + 0.09f * ease
+                        lift = ease * 0.7f
                     }
                 }
             }
             2 -> { // glow
                 if (pressed) {
-                    val t = ((now - pressAnimStart) / 90f).coerceIn(0f, 1f)
+                    val t = ((now - pressAnimStart) / PRESS_ANIM_MS).coerceIn(0f, 1f)
                     glow = t
                 } else if (releaseAnimKey === kr) {
-                    val t = ((now - releaseAnimStart) / 160f).coerceIn(0f, 1f)
+                    val t = ((now - releaseAnimStart) / PRESS_ANIM_MS).coerceIn(0f, 1f)
                     if (t >= 1f) releaseAnimKey = null else glow = 1f - t
                 }
             }
             else -> { // lift (default)
                 if (pressed) {
-                    val t = ((now - pressAnimStart) / 90f).coerceIn(0f, 1f)
+                    val t = ((now - pressAnimStart) / PRESS_ANIM_MS).coerceIn(0f, 1f)
                     scale = 1f + 0.055f * t
                     lift = t
                 } else if (releaseAnimKey === kr) {
-                    val t = ((now - releaseAnimStart) / 140f).coerceIn(0f, 1f)
+                    val t = ((now - releaseAnimStart) / PRESS_ANIM_MS).coerceIn(0f, 1f)
                     if (t >= 1f) {
                         releaseAnimKey = null
                     } else {
@@ -1196,43 +1348,149 @@ class KeyboardView @JvmOverloads constructor(
         return (aa shl 24) or (rr shl 16) or (gg shl 8) or bb
     }
 
-    /** Scratch for the press-preview bubble — never allocate per frame. */
-    private val previewRectScratch = RectF()
+    /** The bubble stays a moment after the lift: until then the finger is in the way of it,
+     *  and at typing speed that is all the time it ever had. The case is the one it was
+     *  showing, since the letter itself can take the shift off as it lands. */
+    private var previewLingerKey: KeyRect? = null
+    private var previewLingerUpper = false
+    private val previewLingerEnd = Runnable { endPreviewLinger() }
 
-    private fun drawPressPreview(canvas: Canvas, kr: KeyRect) {
+    private fun endPreviewLinger() {
+        val kr = previewLingerKey ?: return
+        previewLingerKey = null
+        handler.removeCallbacks(previewLingerEnd)
+        invalidateKeyArea(kr)
+    }
+
+    /** The key whose press preview is showing, or null when there is none.
+     *  Same conditions the old in-canvas bubble used. */
+    private fun previewKey(): KeyRect? {
+        val kr = (pressedKey ?: previewLingerKey) ?: return null
+        return if (previewEnabled && !isSwiping && kr.key.type == KeyType.CHAR && !longPressFired) kr
+        else null
+    }
+
+    /** Gboard's floating press preview: the key's label in a pill above the
+     *  key. Drawn into the window root's ViewOverlay because the pill must
+     *  be free to extend ABOVE this view on the top row (over the bar), and
+     *  clipChildren=false cannot do that: NavStripView.onDraw and
+     *  drawBackground fill the current clip with drawColor, so a widened
+     *  clip would just paint over the strip (the D4/B2 note). The overlay
+     *  draws after every child of the root, unclipped. */
+    private inner class PressPreviewDrawable : Drawable() {
+        private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val fgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
+        var label: String = ""
+
+        override fun draw(canvas: Canvas) {
+            val b = bounds
+            if (b.isEmpty || label.isEmpty()) return
+            bgPaint.color = theme.popupBackground
+            val r = dp(8).toFloat()
+            canvas.drawRoundRect(
+                b.left.toFloat(), b.top.toFloat(), b.right.toFloat(), b.bottom.toFloat(), r, r, bgPaint
+            )
+            fgPaint.color = theme.text
+            fgPaint.textSize = sp(26) * textScale
+            val baseline = b.centerY() - (fgPaint.descent() + fgPaint.ascent()) / 2
+            canvas.drawText(label, b.centerX().toFloat(), baseline, fgPaint)
+        }
+
+        override fun setAlpha(alpha: Int) {
+            bgPaint.alpha = alpha
+            fgPaint.alpha = alpha
+        }
+
+        override fun setColorFilter(colorFilter: ColorFilter?) {
+            bgPaint.colorFilter = colorFilter
+            fgPaint.colorFilter = colorFilter
+        }
+
+        @Deprecated("Required by Drawable")
+        override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+    }
+
+    private var previewOverlay: PressPreviewDrawable? = null
+    private var previewOverlayHost: View? = null
+    /** Where the pill sat in host coordinates last frame — the region a move
+     *  or a removal must repaint, exactly the way the glide bubble unions its
+     *  previous bounds. */
+    private val previewPrevHostRect = Rect()
+    private var previewPrevHostRectValid = false
+    private val previewHostScratch = Rect()
+
+    /** Positions the overlay pill over [previewKey], or removes it. Called
+     *  from onDraw, so every state change that matters already forced a
+     *  repaint of this view. Host dirty rects are kept correct here: the
+     *  pill lives outside this view, so invalidating only inside its bounds
+     *  would leave the pill's pixels unpainted or unerased. */
+    private fun syncPressPreview() {
+        val kr = previewKey()
+        val host = if (kr != null) rootView else null
+        if (kr == null || host == null) {
+            clearPressPreviewOverlay()
+            return
+        }
+
+        // Pill geometry in this view's coordinates. Unlike the old bubble the
+        // top is NOT clamped at 0: the overlay is outside this view's clip.
         val r = kr.rect
         val pw = max(r.width() * 1.15f, dp(34).toFloat())
         val ph = dp(52).toFloat()
         val left = min(max(r.centerX() - pw / 2, dp(2).toFloat()), width - pw - dp(2))
         val top = r.top - ph - dp(4)
-        if (top < 0) return
-        val previewRect = previewRectScratch
-        previewRect.set(left, top, left + pw, top + ph)
 
-        // Pop-in duration follows the animation-level preference; at "off"
-        // the bubble appears instantly (and the extra invalidates stop too).
-        val animMs = when (animLevel) { 0 -> 0f; 1 -> 70f; else -> 110f }
-        val pop = if (animMs <= 0f) 1f
-            else ((System.currentTimeMillis() - previewShownAt) / animMs).coerceIn(0.2f, 1f)
-        canvas.save()
-        canvas.scale(pop, pop, r.centerX(), r.bottom)
-        previewPaint.color = theme.popupBackground
-        canvas.drawRoundRect(previewRect, dp(8).toFloat(), dp(8).toFloat(), previewPaint)
+        // View coordinates -> host coordinates, allocation-free.
+        getLocationOnScreen(locScratch)
+        val vx = locScratch[0]
+        val vy = locScratch[1]
+        host.getLocationOnScreen(locScratch)
+        val dx = vx - locScratch[0]
+        val dy = vy - locScratch[1]
+        val hostRect = previewHostScratch
+        hostRect.set(
+            (left + dx).toInt(), (top + dy).toInt(),
+            (left + pw + dx).toInt() + 1, (top + ph + dy).toInt() + 1
+        )
 
-        previewTextPaint.color = theme.text
-        previewTextPaint.textSize = sp(26) * textScale
-        val label = if (shiftState != ShiftState.OFF && model.isLetters) {
-            kr.key.label.uppercase()
-        } else kr.key.label
-        val baseline = previewRect.centerY() - (previewTextPaint.descent() + previewTextPaint.ascent()) / 2
-        canvas.drawText(label, previewRect.centerX(), baseline, previewTextPaint)
-        canvas.restore()
-        // Pop-in frames repaint only the key's dirty rect (invalidateKeyArea
-        // already budgets for the bubble above it), not the whole grid.
-        if (pop < 1f) {
-            removeCallbacks(pressAnimTick)
-            postDelayed(pressAnimTick, 16)
+        val d = previewOverlay ?: PressPreviewDrawable().also { previewOverlay = it }
+        if (previewOverlayHost !== host) {
+            previewOverlayHost?.overlay?.remove(d)
+            host.overlay.add(d)
+            previewOverlayHost = host
         }
+        d.label = if (kr === previewLingerKey) {
+            if (previewLingerUpper) kr.key.label.uppercase() else kr.key.label
+        } else {
+            if (shiftState != ShiftState.OFF && model.isLetters) kr.key.label.uppercase()
+            else kr.key.label
+        }
+        d.bounds = hostRect
+
+        val pad = dp(8)
+        val dirty = Rect(
+            if (previewPrevHostRectValid) previewPrevHostRect else hostRect
+        )
+        dirty.union(hostRect)
+        host.invalidate(dirty.left - pad, dirty.top - pad, dirty.right + pad, dirty.bottom + pad)
+        previewPrevHostRect.set(hostRect)
+        previewPrevHostRectValid = true
+    }
+
+    private fun clearPressPreviewOverlay() {
+        val d = previewOverlay ?: return
+        previewOverlay = null
+        val host = previewOverlayHost
+        previewOverlayHost = null
+        host?.overlay?.remove(d)
+        if (host != null && previewPrevHostRectValid) {
+            val pad = dp(8)
+            host.invalidate(
+                previewPrevHostRect.left - pad, previewPrevHostRect.top - pad,
+                previewPrevHostRect.right + pad, previewPrevHostRect.bottom + pad
+            )
+        }
+        previewPrevHostRectValid = false
     }
 
     // ---------------------------------------------------------------
@@ -1241,10 +1499,13 @@ class KeyboardView @JvmOverloads constructor(
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked != MotionEvent.ACTION_MOVE) {
+            com.localboard.keyboard.util.PhoneStats.noteKeyDown(event.eventTime)
+        }
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 activePointerId = event.getPointerId(0)
-                handleDownAt(event.x, event.y)
+                handleDownAt(event.x, event.y, event.eventTime)
             }
             MotionEvent.ACTION_POINTER_DOWN -> handlePointerDown(event)
             MotionEvent.ACTION_MOVE -> {
@@ -1253,13 +1514,15 @@ class KeyboardView @JvmOverloads constructor(
             }
             MotionEvent.ACTION_POINTER_UP -> {
                 if (event.getPointerId(event.actionIndex) == activePointerId) {
-                    handleUpAt(event.getX(event.actionIndex), event.getY(event.actionIndex))
+                    handleUpAt(event.getX(event.actionIndex), event.getY(event.actionIndex), event.eventTime)
                     activePointerId = -1
+                    promoteLateFinger(event)
                 }
             }
             MotionEvent.ACTION_UP -> {
-                handleUpAt(event.x, event.y)
+                handleUpAt(event.x, event.y, event.eventTime)
                 activePointerId = -1
+                lateFingerId = -1
             }
             MotionEvent.ACTION_CANCEL -> cancelTouch()
         }
@@ -1271,13 +1534,27 @@ class KeyboardView @JvmOverloads constructor(
      *  Without per-pointer tracking, index-0 coordinates jump between fingers
      *  and read as a huge swipe. */
     private fun handlePointerDown(e: MotionEvent) {
+        // A glide well under way carries on: a thumb coming to rest on the board must not
+        // commit half a word. A finger that has barely moved may still be two-thumb typing.
+        if (isSwiping && swipePathLen > geometry.averageKeyWidth) {
+            lateFingerId = e.getPointerId(e.actionIndex)
+            lateFingerX = e.getX(e.actionIndex)
+            lateFingerY = e.getY(e.actionIndex)
+            lateFingerAt = e.eventTime
+            return
+        }
         val kr = pressedKey
         barSelectMode = false
         if (isSwiping) {
-            val decoded = listener?.onSwipePath(ArrayList(swipePoints)) == true
-            val consumedAsSwipe = decoded || swipePathLen >= width * 0.30f
+            // An abandoned glide stays abandoned, whatever ends it.
+            val decoded = !glideAbandoned && listener?.onSwipePath(ArrayList(swipePoints)) == true
+            val consumedAsSwipe = decoded || glideAbandoned || swipePathLen >= width * 0.30f
             if (!consumedAsSwipe && kr != null && !longPressFired && kr.key.type != KeyType.DELETE) {
-                dispatchKey(kr.key)
+                dispatchTap(kr)
+                // That key may have opened the emoji panel, which takes this view off the
+                // window. No later event reaches it, so the new finger must not start
+                // anything here that only a lift could end.
+                if (!isAttachedToWindow) { pressedKey = null; activePointerId = -1; return }
             }
             listener?.onSwipeEnded()
             glideWord = null
@@ -1286,27 +1563,61 @@ class KeyboardView @JvmOverloads constructor(
             swipePoints.clear()
             swipePathLen = 0f
         } else if (kr != null && !longPressFired && !spaceCursorMode && kr.key.type != KeyType.DELETE) {
-            dispatchKey(kr.key)
+            dispatchTap(kr)
+            if (!isAttachedToWindow) { pressedKey = null; activePointerId = -1; return }
         }
         spaceCursorMode = false
         handler.removeCallbacks(longPressRunnable)
         handler.removeCallbacks(deleteRepeatRunnable)
+        // A popup open under the first finger ends here, and both of its outcomes used to be
+        // lost: the character picked, and the key itself when nothing was picked.
+        if (popupWindow?.isShowing == true && kr != null) {
+            if (popupFingerMoved) {
+                commitPopupSelection()
+            } else {
+                dispatchTap(kr)
+                if (!isAttachedToWindow) { pressedKey = null; activePointerId = -1; return }
+            }
+        }
         dismissPopup()
         pressedKey = null
         activePointerId = e.getPointerId(e.actionIndex)
-        handleDownAt(e.getX(e.actionIndex), e.getY(e.actionIndex))
+        handleDownAt(e.getX(e.actionIndex), e.getY(e.actionIndex), e.eventTime)
     }
 
-    private fun handleDownAt(x: Float, y: Float) {
+    /**
+     * A glide's finger has just lifted. A finger that landed in its last moments is the next
+     * letter or glide, begun while this one finished, so it becomes a touch like any other, from
+     * where it landed: a next glide needs that origin. One that landed earlier is a thumb at
+     * rest. It stays ignored and types nothing at its own lift. Backspace is left out because it
+     * acts on the touch, and would take the word just committed.
+     */
+    private fun promoteLateFinger(e: MotionEvent) {
+        val id = lateFingerId
+        lateFingerId = -1
+        if (id < 0 || e.findPointerIndex(id) < 0) return
+        if (e.eventTime - lateFingerAt > LATE_FINGER_MS) return
+        if (findKey(lateFingerX, lateFingerY)?.key?.type == KeyType.DELETE) return
+        activePointerId = id
+        handleDownAt(lateFingerX, lateFingerY, lateFingerAt)
+    }
+
+    private fun handleDownAt(x: Float, y: Float, eventTime: Long) {
+        // A popup left over from a touch that never lifted must not catch this tap.
+        dismissPopup()
+        endPreviewLinger()
         downX = x
         downY = y
+        downAt = eventTime
         isSwiping = false
         longPressFired = false
         spaceCursorMode = false
+        glideAbandoned = false
         pendingPoints.clear()
         pendingPoints += PointF(x, y)
+        rawCount = 0
+        recordRaw(x, y, eventTime)
         pressAnimStart = System.currentTimeMillis()
-        previewShownAt = pressAnimStart
         pressedKey = findKey(x, y)
         pressedKey?.let { kr ->
             feedback()
@@ -1314,7 +1625,7 @@ class KeyboardView @JvmOverloads constructor(
                 KeyType.DELETE -> {
                     listener?.onKey(KeyType.DELETE)
                     deleteRepeatCount = 0
-                    handler.postDelayed(deleteRepeatRunnable, 500)
+                    handler.postDelayed(deleteRepeatRunnable, 400)
                 }
                 else -> {
                     // P2: the space bar has no popup chars but still wants a
@@ -1323,6 +1634,12 @@ class KeyboardView @JvmOverloads constructor(
                         kr.key.type == KeyType.SPACE ||
                         kr.key.type == KeyType.ENTER
                     ) {
+                        // A frame still awaited belongs to the press before this one.
+                        if (longPressAwaitingFrame) {
+                            longPressAwaitingFrame = false
+                            removeCallbacks(longPressAfterFrame)
+                        }
+                        longPressDueAt = SystemClock.uptimeMillis() + longPressMs
                         handler.postDelayed(longPressRunnable, longPressMs)
                     }
                 }
@@ -1331,7 +1648,7 @@ class KeyboardView @JvmOverloads constructor(
             liveBg.onKeyPress()
             // The nav-bar strip runs its own LiveBackground, so a reactive
             // style there needs the same signal or it would never react.
-            onKeyPressed?.invoke()
+            onKeyPressed?.invoke(kr.key.type)
             // One key changed, so repaint one key's worth of pixels. This was
             // a full-view invalidate, i.e. all ~40 keys, on every keystroke.
             invalidateKeyArea(kr)
@@ -1349,15 +1666,22 @@ class KeyboardView @JvmOverloads constructor(
         }
 
         // P2: sliding along the space bar scrubs the editor cursor one char
-        // per step (Gboard-style). Arms after a small dead zone so a resting
-        // thumb's jitter never moves the cursor; starting the slide cancels
-        // the pending long-press (IME switcher).
+        // per step (Gboard-style). Under the arming distance a lift types the
+        // space, so a thumb that rolls sideways on the most used key still
+        // gets it. Arming moves the caret at once: there is no stretch where a
+        // lift would do nothing at all. The one case left is the end of the
+        // text, where a move right has nowhere to go and no space comes either.
         if (kr.key.type == KeyType.SPACE && !longPressFired) {
             val sx = e.getX(idx)
-            if (!spaceCursorMode && kotlin.math.abs(sx - downX) > dp(10)) {
+            val slid = abs(sx - downX)
+            // Sooner than arming, or a slow start to a scrub opens the IME switcher.
+            if (slid > longPressCancelPx) handler.removeCallbacks(longPressRunnable)
+            if (!spaceCursorMode && slid > dp(24)) {
                 spaceCursorMode = true
-                spaceCursorLastX = downX
+                spaceCursorLastX = sx
                 handler.removeCallbacks(longPressRunnable)
+                listener?.onSpaceCursorMove(if (sx > downX) 1 else -1)
+                return
             }
             if (spaceCursorMode) {
                 val stepPx = dp(16).toFloat()
@@ -1370,13 +1694,28 @@ class KeyboardView @JvmOverloads constructor(
             }
         }
 
+        // A letter's popup is for a finger that stays put. Past twice the slop this is a glide
+        // starting slowly, or a slip where gliding is off, and at 380 ms it would otherwise
+        // throw the gesture away for a digit or a symbol at lift.
+        if (!isSwiping && (swipeEnabled || glideBlockedHere) && model.isLetters &&
+            kr.key.type == KeyType.CHAR && !longPressFired
+        ) {
+            val dx = e.getX(idx) - downX
+            val dy = e.getY(idx) - downY
+            if (dx * dx + dy * dy > longPressCancelPx * longPressCancelPx) {
+                handler.removeCallbacks(longPressRunnable)
+            }
+        }
+
         // Start glide typing when the finger travels on the letter board.
         if (!isSwiping && swipeEnabled && model.isLetters &&
             kr.key.type == KeyType.CHAR && !longPressFired
         ) {
             val dx = e.getX(idx) - downX
             val dy = e.getY(idx) - downY
-            val act = swipeActivation
+            // Above the keys it is today's distance: a flick up to pick a word right after
+            // typing has only the top row to travel in, and could never make the longer one.
+            val act = if (e.getY(idx) < -barEnterPx) swipeActivation else armingDistance(e.eventTime)
             if (dx * dx + dy * dy > act * act) {
                 isSwiping = true
                 glideWord = null
@@ -1406,8 +1745,20 @@ class KeyboardView @JvmOverloads constructor(
                 // path itself: a raw cap of 40 samples was a third of a
                 // second on a 120 Hz digitizer, after which a slow-starting
                 // glide lost the stretch between its origin and the arming
-                // point.
+                // point. History counts too: at 60 Hz while typing, a glide begun
+                // under the longer arming distance would otherwise reach the
+                // decoder with half of its first 150 ms.
+                for (i in 0 until e.historySize) {
+                    val hx = e.getHistoricalX(idx, i); val hy = e.getHistoricalY(idx, i)
+                    recordRaw(hx, hy, e.getHistoricalEventTime(i))
+                    if (pendingPoints.size < 400 &&
+                        dist(pendingPoints.last(), hx, hy) >= minPointGapPx
+                    ) {
+                        pendingPoints += PointF(hx, hy)
+                    }
+                }
                 val ex = e.getX(idx); val ey = e.getY(idx)
+                recordRaw(ex, ey, e.eventTime)
                 if (pendingPoints.size < 400 &&
                     dist(pendingPoints.last(), ex, ey) >= minPointGapPx
                 ) {
@@ -1417,20 +1768,43 @@ class KeyboardView @JvmOverloads constructor(
         }
 
         if (isSwiping) {
+            if (glideAbandoned) return
             val ex = e.getX(idx)
             val ey = e.getY(idx)
+            barTouchAt = e.eventTime
             // Swipe-up word selection: above the top edge is the suggestion
             // bar's strip. The glide freezes (points stop accruing, so the
             // frozen path stays decodable) and the finger drives the bar's
             // highlight instead — Gboard-style "slide up to pick a word".
             if (barSelectMode) {
-                listener?.onSwipeBarHover((ex / width).coerceIn(0f, 1f))
+                if (ey <= barExitPx) {
+                    listener?.onSwipeBarHover((ex / width).coerceIn(0f, 1f))
+                    return
+                }
+                // Back on the keys. Coming back near where it left, the glide carries on from
+                // there. Far from it, the straight line between would be a stroke nobody
+                // traced, so nothing comes of this gesture: a lost word costs one more glide,
+                // a wrong one costs a delete as well.
+                barSelectMode = false
+                listener?.onSwipeBarHover(-1f)
+                lastSampleX = ex; lastSampleY = ey
+                if (abs(ex - swipePoints.last().x) > geometry.averageKeyWidth * 1.5f) {
+                    glideAbandoned = true
+                    glideWord = null
+                    trail?.finish()
+                    invalidateTrailArea()
+                    return
+                }
+                // This event's history is from over the bar, so only its own point counts.
+                recordRaw(ex, ey, e.eventTime)
+                swipePoints += PointF(ex, ey)
+                trail?.add(ex, ey)
+                invalidateTrailArea()
                 return
             }
-            if (ey < -dp(2)) {
+            if (ey < -barEnterPx) {
                 barSelectMode = true
                 glideWord = null
-                trail?.finish()
                 listener?.onSwipeBarHover((ex / width).coerceIn(0f, 1f))
                 invalidate()
                 return
@@ -1446,11 +1820,13 @@ class KeyboardView @JvmOverloads constructor(
             // so the visual stays smooth.
             for (i in 0 until e.historySize) {
                 val hx = e.getHistoricalX(idx, i); val hy = e.getHistoricalY(idx, i)
+                recordRaw(hx, hy, e.getHistoricalEventTime(i))
                 swipePathLen += dist(lastSampleX, lastSampleY, hx, hy)
                 lastSampleX = hx; lastSampleY = hy
                 if (dist(swipePoints.last(), hx, hy) >= minPointGapPx) swipePoints += PointF(hx, hy)
                 trail?.add(hx, hy)
             }
+            recordRaw(ex, ey, e.eventTime)
             swipePathLen += dist(lastSampleX, lastSampleY, ex, ey)
             lastSampleX = ex; lastSampleY = ey
             if (dist(swipePoints.last(), ex, ey) >= minPointGapPx) swipePoints += PointF(ex, ey)
@@ -1484,7 +1860,69 @@ class KeyboardView @JvmOverloads constructor(
     private var lastSampleX = 0f
     private var lastSampleY = 0f
 
-    private fun handleUpAt(x: Float, y: Float) {
+    // Into the bar a good way above the keys, so a small overshoot on the top row stays a
+    // glide, and back out a little below their top edge, so that one finger wavering at the
+    // edge does not flip between the two.
+    private val barEnterPx: Float by lazy { dp(10f).toFloat() }
+    private val barExitPx: Float by lazy { dp(4f).toFloat() }
+
+    /** The finger came back from the bar far from where it left. Moves are ignored from then
+     *  on, and the lift commits nothing and types nothing. */
+    private var glideAbandoned = false
+
+    /** A letter right after a tap has to slide further before it can be a glide, for its first
+     *  150 ms: a thumb that slips during a tap is not starting a word. A real glide loses
+     *  nothing, because the samples are kept from finger-down. */
+    private fun armingDistance(now: Long): Float {
+        val base = swipeActivation
+        return if (now - lastTapCommitAt < 500 && now - downAt < 150) {
+            max(base, geometry.averageKeyWidth * 1.6f)
+        } else {
+            base
+        }
+    }
+
+    // Every raw sample of the touch, unthinned, for the pause on a doubled letter. Primitive
+    // arrays and no PointF per sample: a move event must not pay in garbage for this.
+    private val rawXs = FloatArray(RAW_SAMPLE_CAPACITY)
+    private val rawYs = FloatArray(RAW_SAMPLE_CAPACITY)
+    private val rawTimes = LongArray(RAW_SAMPLE_CAPACITY)
+    private var rawCount = 0
+    private val dwellKeyX = FloatArray(26)
+    private val dwellKeyY = FloatArray(26)
+
+    private fun recordRaw(x: Float, y: Float, time: Long) {
+        if (rawCount >= RAW_SAMPLE_CAPACITY) return
+        rawXs[rawCount] = x
+        rawYs[rawCount] = y
+        rawTimes[rawCount] = time
+        rawCount++
+    }
+
+    /**
+     * Letters the finger paused on in this glide, as a 26-bit mask with bit c-'a'. Null means
+     * the decoder should use its own fallback, never "no pauses": not swiping, no key width
+     * yet, or so long a stroke that the samples ran out. Main thread only. Good inside
+     * onSwipePath and onSwipeProgress: the samples are reset at the next finger down, so a
+     * caller that goes off the main thread reads it first and passes the Int along.
+     */
+    fun swipeDwellMask(): Int? {
+        if (!isSwiping) return null
+        val keyW = geometry.averageKeyWidth
+        if (keyW <= 0f || rawCount >= RAW_SAMPLE_CAPACITY) return null
+        dwellKeyX.fill(Float.NaN)
+        dwellKeyY.fill(Float.NaN)
+        for ((c, p) in geometry.keyCenters) {
+            val i = c - 'a'
+            if (i in 0 until 26) {
+                dwellKeyX[i] = p.x
+                dwellKeyY[i] = p.y
+            }
+        }
+        return DwellMask.of(rawXs, rawYs, rawTimes, rawCount, keyW, dwellKeyX, dwellKeyY)
+    }
+
+    private fun handleUpAt(x: Float, y: Float, eventTime: Long) {
         handler.removeCallbacks(longPressRunnable)
         handler.removeCallbacks(deleteRepeatRunnable)
 
@@ -1497,20 +1935,28 @@ class KeyboardView @JvmOverloads constructor(
         }
 
         val kr = pressedKey
+        val upperAtLift = shiftState != ShiftState.OFF && model.isLetters
+        var tapped = false
         if (isSwiping) {
             var consumedByBar = false
-            if (barSelectMode) {
-                barSelectMode = false
+            val wasOverBar = barSelectMode
+            barSelectMode = false
+            if (wasOverBar && y < 0f) {
                 // Lifted over the bar: commit whichever word the finger is on.
                 // False (gap between words / empty slot) falls through to the
                 // normal decode of the frozen path — no gesture is ever lost.
+                barTouchAt = eventTime
                 consumedByBar = listener?.onSwipeBarPick((x / width).coerceIn(0f, 1f)) == true
             }
-            if (!consumedByBar) {
-                swipePathLen += dist(lastSampleX, lastSampleY, x, y)
-                // The lift point is always kept regardless of spacing: it is
-                // the end of the word and the decoder anchors on it.
-                swipePoints += PointF(x, y)
+            if (!consumedByBar && !glideAbandoned) {
+                // A lift over the bar is off the path, and the decoder would anchor on it.
+                if (!wasOverBar) {
+                    recordRaw(x, y, eventTime)
+                    swipePathLen += dist(lastSampleX, lastSampleY, x, y)
+                    // The lift point is always kept regardless of spacing: it is
+                    // the end of the word and the decoder anchors on it.
+                    swipePoints += PointF(x, y)
+                }
                 // Activation (≈ one key width) already guarantees intent; this is
                 // only a second-chance guard so decode failures fall back to a tap.
                 // Just under the decoder's own floor (0.7 key widths ≈ 0.07
@@ -1524,7 +1970,7 @@ class KeyboardView @JvmOverloads constructor(
                 // every failed word ("jumped" → "jhjd").
                 val consumedAsSwipe = decoded || swipePathLen >= width * 0.30f
                 if (!consumedAsSwipe && kr != null && !longPressFired && kr.key.type != KeyType.DELETE) {
-                    dispatchKey(kr.key)
+                    dispatchTap(kr)
                 }
             }
             listener?.onSwipeEnded()
@@ -1540,15 +1986,8 @@ class KeyboardView @JvmOverloads constructor(
             // DELETE fired on finger-down (repeat starts there); every other
             // key fires on up. Dispatching DELETE here too ate two chars.
             // A space-bar cursor scrub must not also type a space on lift.
-            recordTapLearning(kr, x, y)
-            // A4: stash the raw tap point for the service's tap trace — the
-            // joint spatial correction scores WHERE the finger landed, not
-            // just which letter won the rect lookup. Consumed synchronously
-            // by handleText; any non-letter dispatch leaves it null.
-            lastCharTapPoint = if (kr.key.type == KeyType.CHAR &&
-                kr.key.output.length == 1 && kr.key.output[0].isLetter()
-            ) PointF(x, y) else null
-            dispatchKey(kr.key)
+            dispatchTap(kr)
+            tapped = true
         }
 
         isSwiping = false
@@ -1563,25 +2002,33 @@ class KeyboardView @JvmOverloads constructor(
         releaseAnimKey = if (stillValid) kr else null
         releaseAnimStart = System.currentTimeMillis()
         pressedKey = null
+        if (tapped && stillValid && previewEnabled && kr != null && kr.key.type == KeyType.CHAR) {
+            previewLingerKey = kr
+            previewLingerUpper = upperAtLift
+            handler.removeCallbacks(previewLingerEnd)
+            handler.postDelayed(previewLingerEnd, PREVIEW_LINGER_MS)
+        }
         // Release animation is also one key's worth of pixels.
         if (stillValid) invalidateKeyArea(kr) else invalidate()
     }
 
-    /** Record the tap for the per-key learning model (plain taps only). */
-    private fun recordTapLearning(kr: KeyRect?, x: Float, y: Float) {
-        val key = kr?.key ?: return
-        if (key.type != KeyType.CHAR || key.output.length != 1) return
-        val d = resources.displayMetrics.density
-        tapModel?.record(key.output, (x - kr.rect.centerX()) / d, (y - kr.rect.centerY()) / d)
+    /** The field changed with the keyboard still up, and a held Backspace must not run on into
+     *  the next one. Nothing else about the touch ends here: a digit being pressed as a code
+     *  form moves to its next box still types at its lift. */
+    fun stopDeleteRepeat() {
+        handler.removeCallbacks(deleteRepeatRunnable)
     }
 
     private fun cancelTouch() {
         activePointerId = -1
+        lateFingerId = -1
         handler.removeCallbacks(longPressRunnable)
         handler.removeCallbacks(deleteRepeatRunnable)
         dismissPopup()
+        endPreviewLinger()
         barSelectMode = false
         spaceCursorMode = false
+        glideAbandoned = false
         if (isSwiping) {
             listener?.onSwipeEnded()
             glideWord = null
@@ -1591,6 +2038,22 @@ class KeyboardView @JvmOverloads constructor(
         isSwiping = false
         pressedKey = null
         invalidate()
+    }
+
+    /**
+     * A key dispatched because a touch of it ended. The point is where the finger came down,
+     * for the service's tap trace: rollover and failed-glide taps have one like any other, and
+     * [downX] still holds this finger at every site, because a new finger is only tracked
+     * after this runs. The service consumes it synchronously in handleText; anything but a
+     * single letter leaves it null. The time is what the next touch measures [armingDistance]
+     * from.
+     */
+    private fun dispatchTap(kr: KeyRect) {
+        lastCharTapPoint = if (kr.key.type == KeyType.CHAR &&
+            kr.key.output.length == 1 && kr.key.output[0].isLetter()
+        ) PointF(downX, downY) else null
+        lastTapCommitAt = SystemClock.uptimeMillis()
+        dispatchKey(kr.key)
     }
 
     private fun dispatchKey(key: Key) {
@@ -1693,97 +2156,62 @@ class KeyboardView @JvmOverloads constructor(
     override fun dispatchHoverEvent(event: MotionEvent): Boolean =
         keyTouchHelper.dispatchHoverEvent(event) || super.dispatchHoverEvent(event)
 
-    /** Center of a letter key in dp (for calibration math), null if absent. */
-    fun keyCenterDp(letter: Char): PointF? {
-        for (kr in keyRects) {
-            if (kr.key.type == KeyType.CHAR &&
-                kr.key.output.equals(letter.toString(), ignoreCase = true)
-            ) {
-                val d = resources.displayMetrics.density
-                return PointF(kr.rect.centerX() / d, kr.rect.centerY() / d)
-            }
-        }
-        return null
-    }
-
+    /**
+     * The key a touch-down means. The point decides it alone: every point of the grid
+     * belongs to exactly one key, so what is drawn is what gets typed, and the margin
+     * beside an outer key is that key's rather than a neighbour's from another row.
+     */
     private fun findKey(x: Float, y: Float): KeyRect? {
-        // Stock feel first: the key whose rect contains the tap wins, always.
-        // The per-key model is a NUDGE, not a re-targeting system — it votes
-        // only when the tap MISSES every rect (edge slips and gap taps, which
-        // is exactly where finger-habit errors live). Re-targeting every tap
-        // to the nearest learned center made keys feel smaller and fights.
-        for (kr in keyRects) {
-            if (kr.rect.contains(x, y)) return kr
-        }
-        // The gaps between keys are visual only — a tap inside a gap belongs
-        // to the nearer key (each key's hit area extends half a gap, the
-        // AOSP midpoint rule). Gaps are ~10% of the keyboard width; treating
-        // them as dead zones was eating taps on fast typing.
-        val halfX = keyGap / 2f
-        val halfY = rowGap / 2f
-        var gapBest: KeyRect? = null
-        var gapBestD = Float.MAX_VALUE
-        for (kr in keyRects) {
-            val r = kr.rect
-            if (x >= r.left - halfX && x <= r.right + halfX &&
-                y >= r.top - halfY && y <= r.bottom + halfY
-            ) {
-                val dx = x - r.centerX()
-                val dy = y - r.centerY()
-                val d = dx * dx + dy * dy
-                if (d < gapBestD) { gapBestD = d; gapBest = kr }
-            }
-        }
-        if (gapBest != null) return gapBest
-        val tm = tapModel
-        if (tm != null && tm.hasOffsets()) {
-            val density = resources.displayMetrics.density
-            var best: KeyRect? = null
-            var bestD2 = Float.MAX_VALUE
-            for (kr in keyRects) {
-                if (kr.key.type != KeyType.CHAR || kr.key.output.length != 1) continue
-                val off = tm.offsetFor(kr.key.output) ?: continue
-                // Deadband: offsets under ~3dp are noise, not a habit.
-                if (off.first * off.first + off.second * off.second < 9f) continue
-                val cx = kr.rect.centerX() + off.first * density
-                val cy = kr.rect.centerY() + off.second * density
-                val dx = x - cx
-                val dy = y - cy
-                val d2 = dx * dx + dy * dy
-                if (d2 < bestD2) { bestD2 = d2; best = kr }
-            }
-            // Miss-only and close to a learned landing zone: nudge it there.
-            val keyW = if (width > 0) width / 10f else dp(44).toFloat()
-            val threshold = keyW * 0.55f
-            if (best != null && bestD2 < threshold * threshold) return best
-        }
-        // Forgiving bottom row: snap near-misses vertically.
-        // Forgiving bottom row: snap near-misses vertically.
-        for (kr in keyRects) {
-            if (x >= kr.rect.left && x <= kr.rect.right &&
-                abs(y - kr.rect.centerY()) < keyHeightPx * 0.75f
-            ) return kr
-        }
-        // Fast sloppy taps often land in the gaps between keys: assign the tap
-        // to the nearest key instead of dropping the letter.
-        var best: KeyRect? = null
-        var bestD2 = Float.MAX_VALUE
-        val maxDx = keyGap * 0.9f
-        for (kr in keyRects) {
-            val dx = maxOf(kr.rect.left - x, 0f, x - kr.rect.right)
-            val dy = maxOf(kr.rect.top - y, 0f, y - kr.rect.bottom)
-            if (dx > maxDx) continue
-            val d2 = dx * dx + dy * dy
-            if (d2 < bestD2) { bestD2 = d2; best = kr }
-        }
-        return best
+        val i = hitMap?.keyAt(x, y) ?: return null
+        return keyRects.getOrNull(i)
     }
 
     // ---------------------------------------------------------------
     // Long-press alternates popup
     // ---------------------------------------------------------------
 
+    /** The popup's background: Gboard's white chip — a rounded slab for the
+     *  tile rows plus a small tail dropping from item 0's column down toward
+     *  the pressed key. The tail is why the tile row keeps a few dp of
+     *  bottom padding. */
+    private inner class PopupChipDrawable : Drawable() {
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val tail = Path()
+        /** Tail anchor in container coordinates, set after the measure pass. */
+        var notchX = 0f
+
+        override fun draw(canvas: Canvas) {
+            val b = bounds
+            if (b.width() <= 0 || b.height() <= 0) return
+            paint.color = theme.popupBackground
+            val tailH = dp(7).toFloat()
+            val bodyBottom = (b.bottom - tailH).coerceAtLeast(b.top.toFloat())
+            val radius = dp(10).toFloat()
+            canvas.drawRoundRect(
+                b.left.toFloat(), b.top.toFloat(), b.right.toFloat(), bodyBottom,
+                radius, radius, paint
+            )
+            if (bodyBottom < b.bottom) {
+                val halfW = dp(6).toFloat()
+                tail.reset()
+                tail.moveTo(notchX - halfW, bodyBottom - 1f)
+                tail.lineTo(notchX, b.bottom.toFloat())
+                tail.lineTo(notchX + halfW, bodyBottom - 1f)
+                tail.close()
+                canvas.drawPath(tail, paint)
+            }
+        }
+
+        override fun setAlpha(alpha: Int) { paint.alpha = alpha }
+        override fun setColorFilter(colorFilter: ColorFilter?) { paint.colorFilter = colorFilter }
+        @Deprecated("Required by Drawable")
+        override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+    }
+
     private fun fireLongPress() {
+        // Off the window there is no token to show a popup with, and no lift to come. Enter's
+        // action would send the message with nobody holding the key.
+        if (!isAttachedToWindow) return
         val kr = pressedKey ?: return
         if (kr.key.type == KeyType.ENTER) {
             // Enter now types a newline in fields that accept one, so the
@@ -1811,7 +2239,15 @@ class KeyboardView @JvmOverloads constructor(
 
     private fun showPopup(kr: KeyRect) {
         dismissPopup()
-        val items = kr.key.popup
+        // The default alternative is the key's OWN label, Gboard-style: the
+        // first tile is the plain letter and the accents (or digit hints on
+        // the top row) fan out after it. Hold-and-release types the same
+        // letter a tap would, so nothing about the popup can surprise a key
+        // that only got held a moment too long.
+        val plain = if (model.isLetters && shiftState != ShiftState.OFF) kr.key.label.uppercase()
+        else kr.key.label
+        val items = listOf(plain) + kr.key.popup
+        popupItems = items
         // A GRID, Gboard-style, not a strip: the period key alone carries
         // sixteen marks, and a sixteen-wide strip runs off both screen
         // edges. Rows of up to POPUP_COLUMNS, the FIRST row nearest the key
@@ -1820,9 +2256,10 @@ class KeyboardView @JvmOverloads constructor(
         // so the strip has room instead of being clamped against the edge
         // with item 0 far from the finger.
         val leftward = kr.rect.centerX() > width / 2f
+        val chip = PopupChipDrawable()
         val container = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(theme.popupBackground)
+            background = chip
             setPadding(dp(6), dp(4), dp(6), dp(4))
         }
         // Labels are created in ITEM order (so an index into popupLabels is
@@ -1854,6 +2291,7 @@ class KeyboardView @JvmOverloads constructor(
         }
         popupLabels = labels
         popupSelected = 0
+        popupFingerMoved = false
         popupLabels[0].setBackgroundColor(theme.accent)
         popupLabels[0].setTextColor(onAccentColor())
 
@@ -1883,26 +2321,55 @@ class KeyboardView @JvmOverloads constructor(
         // the highlight sat on item 0, so the first move event snapped the
         // selection to whatever happened to be under the finger. On the top
         // row that meant long-pressing "e" and releasing gave an accent
-        // instead of the digit — the digit is item 0 precisely because it is
-        // meant to be the default. Item 0's horizontal position inside the
+        // instead of the letter. Item 0's horizontal position inside the
         // container depends on the fan direction, so it is read back after
-        // the measure pass rather than assumed to be the left edge.
+        // the measure pass rather than assumed to be the left edge. The
+        // chip's tail hangs from that same point, Gboard-style.
         val first = popupLabels[0]
         val item0Centre = if (leftward) {
             container.measuredWidth - container.paddingRight - first.measuredWidth / 2f
         } else {
             container.paddingLeft + first.measuredWidth / 2f
         }
-        val x = (r.centerX() - item0Centre)
+        chip.notchX = item0Centre
+        // showAtLocation's offsets are measured from the top-left of the IME
+        // WINDOW (the root view's frame), not from this view's top-left — the
+        // comment that lived here had the frame wrong, which is how the popup
+        // ended up drawn on top of the suggestion bar for every row. Adding
+        // the view's own full screen Y was the old "bottom edge" bug for the
+        // same reason: both mistakes amount to missing the view-to-window
+        // delta. The same delta the press preview converts through when it
+        // draws on rootView's overlay. Fetched fresh here rather than reusing
+        // the popup-origin lookup so a future edit can't desynchronise them.
+        getLocationOnScreen(loc)
+        rootView.getLocationOnScreen(rootLocScratch)
+        val x = (loc[0] - rootLocScratch[0] + r.centerX() - item0Centre)
             .roundToInt()
             .coerceIn(0, max(0, width - container.measuredWidth))
-        val yOff = (r.top - container.measuredHeight - dp(6)).toInt()
-        popup.showAtLocation(this, Gravity.NO_GRAVITY, x, yOff + locationOnScreenY())
-    }
-
-    private fun locationOnScreenY(): Int {
-        getLocationOnScreen(locScratch)
-        return locScratch[1]
+        val yOff = (loc[1] - rootLocScratch[1] + r.top - container.measuredHeight - dp(6)).toInt()
+        popup.showAtLocation(this, Gravity.NO_GRAVITY, x, yOff)
+        // Scale-in out of the key, Gboard-style: the chip's tail end is the
+        // pivot, so it grows from the key it belongs to. A slide onto the
+        // next key rebuilds the popup (dismissPopup above) and the new chip
+        // animates from its own key — the animations never stack. With the
+        // system animator scale at 0 (reduced/off) the chip appears fully
+        // formed instead.
+        val popupInMs = (POPUP_IN_MS * animatorScale()).toLong()
+        if (popupInMs > 0L) {
+            container.pivotX = item0Centre
+            container.pivotY = container.measuredHeight.toFloat()
+            container.scaleX = 0.82f
+            container.scaleY = 0.82f
+            container.alpha = 0f
+            container.animate()
+                .scaleX(1f).scaleY(1f).alpha(1f)
+                .setDuration(popupInMs)
+                .setInterpolator(POPUP_IN_INTERPOLATOR)
+                .start()
+        }
+        // The popup replaces the press preview: longPressFired flipped above,
+        // and this repaint is what hides the overlay pill.
+        invalidate()
     }
 
     /** Readable text color on the accent (yellow accent needs black, the
@@ -1926,6 +2393,7 @@ class KeyboardView @JvmOverloads constructor(
         if (popupOriginX >= 0f && abs(rawX - popupOriginX) < popupStickyPx &&
             abs(rawY - popupOriginY) < popupStickyPx
         ) return
+        popupFingerMoved = true
         container.getLocationOnScreen(locScratch)
         val localX = rawX - locScratch[0]
         val localY = rawY - locScratch[1]
@@ -1965,22 +2433,25 @@ class KeyboardView @JvmOverloads constructor(
     }
 
     private fun commitPopupSelection() {
-        val kr = pressedKey ?: return
         // CRASH FIX: coerceIn(0, size - 1) builds an EMPTY range when the key
         // has no popup entries at all (size 0 -> max = -1), which throws
         //   IllegalArgumentException: Cannot coerce value to an empty range
         // Reachable whenever a long-press lands on a key without alternates.
-        if (kr.key.popup.isEmpty()) return
-        val idx = popupSelected.coerceIn(0, kr.key.popup.size - 1)
-        val text = kr.key.popup.getOrNull(idx) ?: return
+        if (pressedKey == null || popupItems.isEmpty()) return
+        val idx = popupSelected.coerceIn(0, popupItems.size - 1)
+        val text = popupItems.getOrNull(idx) ?: return
         val out = if (model.isLetters && shiftState != ShiftState.OFF) text.uppercase() else text
         listener?.onText(out)
         if (shiftState == ShiftState.ON) shiftState = ShiftState.OFF
     }
 
     private fun dismissPopup() {
+        // Stop a scale-in mid-flight so a recycled content view never holds
+        // a running animator; the window going away makes the rest moot.
+        popupWindow?.contentView?.animate()?.cancel()
         popupWindow?.dismiss()
         popupWindow = null
+        popupItems = emptyList()
         popupOriginX = -1f
         popupOriginY = -1f
     }
@@ -2002,11 +2473,21 @@ class KeyboardView @JvmOverloads constructor(
 
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
+        // A tick cleared below never told anyone about these rects, so let the next
+        // computeKeyRects report them even if they come out the same.
+        if (handler.hasCallbacks(geometryReadyTick)) notifiedRectsHash = 0
+        // Its end is one of the callbacks cleared here, and it must not be up on the way back.
+        previewLingerKey = null
         handler.removeCallbacksAndMessages(null)
         dismissPopup()
+        clearPressPreviewOverlay()
         // Three view-sized bitmaps are worth releasing when the keyboard goes
         // away: the IME process is long-lived and usually idle, and held
-        // bitmaps are memory pressure on the entire system.
+        // bitmaps are memory pressure on the entire system. The page-fade
+        // snapshot is a fourth of the same size; without this a hide landing
+        // mid-crossfade (or the emoji panel opening from a page key) pins it
+        // until the next setKeyboard.
+        endPageTransition()
         keysLayer?.recycle(); keysLayer = null
         bgLayer?.recycle(); bgLayer = null
         liveBg.release()
@@ -2028,12 +2509,47 @@ class KeyboardView @JvmOverloads constructor(
     override fun onWindowVisibilityChanged(visibility: Int) {
         super.onWindowVisibilityChanged(visibility)
         if (visibility == VISIBLE) markLayersDirty()
+        // A hidden window hears no lift, so nothing held may run on behind it.
+        if (visibility != VISIBLE) cancelTouch()
     }
 
     private companion object {
         /** Gboard's popup width: the period key's sixteen marks are two
          *  rows of eight. */
         private const val POPUP_COLUMNS = 8
+
+        /** About 17 s of one finger at 120 Hz. A stroke that fills it gets the decoder's fallback. */
+        private const val RAW_SAMPLE_CAPACITY = 2048
+
+        /** How long a key takes to press and to settle: 3 to 4 frames, since a key that is
+         *  still moving when the next one lands reads as lag at typing speed. */
+        private const val PRESS_ANIM_MS = 64f
+
+        /** Page-change crossfade length. Short enough to read as a swap, long
+         *  enough not to chase the finger to the next key. Scaled by the
+         *  system animator duration scale at swap time. */
+        private const val PAGE_TRANSITION_MS = 150f
+
+        /** Popup scale-in length — under the 150 ms the eye reads as instant. */
+        private const val POPUP_IN_MS = 120f
+
+        /** Fast-out curve for the popup's scale-in: most of the growth lands
+         *  in the first half so the chip feels like it pops, not a swell. */
+        private val POPUP_IN_INTERPOLATOR: android.view.animation.Interpolator =
+            android.view.animation.PathInterpolator(0.2f, 0f, 0.25f, 1f)
+
+        private const val PREVIEW_LINGER_MS = 60L
+
+        /** A long press this far past due has sat behind a stall, and moves may be queued that were never read. Two
+         *  frames, so that an ordinary busy frame delays nobody. A proposal, not measured on real fingers. */
+        private const val LONG_PRESS_LATE_MS = 32L
+
+        /** How long that look waits for a frame before a long press goes ahead without one. */
+        private const val LONG_PRESS_FRAME_WAIT_MS = 500L
+
+        /** How close to a glide's lift a second finger must have landed to count as the next
+         *  touch. Anything older is taken for a thumb at rest. A proposal, not measured. */
+        private const val LATE_FINGER_MS = 200L
 
         /** I/O-free placeholder theme, replaced by setTheme() before the view
          *  is ever shown. Mirrors KeyboardTheme.fromPalette for the built-in

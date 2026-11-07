@@ -7,11 +7,9 @@ import ai.liquid.leap.ModelRunner
 import ai.liquid.leap.message.ChatMessage
 import ai.liquid.leap.message.GenerationStats
 import ai.liquid.leap.message.MessageResponse
-import android.content.Context
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
@@ -26,57 +24,66 @@ import kotlinx.coroutines.withContext
  * reports LFM drafts feel right on-device — this class is how they get
  * that exact behavior inside the keyboard.
  *
- * One instance lives inside LlamaCppProvider (the draft-lane dispatcher),
- * so the idle-unload watchdog and every call site (✨, test lab, nightly
- * distillation) treat it as the same "neural provider".
+ * There is one of these per process, behind every LlamaCppProvider (the draft-lane
+ * dispatcher), so the idle-unload watchdog and every call site (✨, test lab, nightly
+ * distillation) treat it as the same "neural provider". One each would mean a model
+ * loaded each, and one instance unloading what it knows of while another is running.
+ *
+ * Whoever loads or generates holds [lock] for the whole run, the same lock that orders
+ * the llama.cpp decodes on the draft lane. That covers what can be seen from here: the
+ * lock is let go when the collect exits, and whether the SDK's own native work has
+ * stopped by then cannot be read from outside it.
  */
-class LeapEngine(private val context: Context) {
+class LeapEngine private constructor() {
+
+    /** Who runs next. Take it around [ensureLoaded] and [generate] together. */
+    val lock: Mutex get() = LlamaCppBridge.slotDecodeLock(LlamaCppBridge.SLOT_DRAFT)
 
     @Volatile
     var loadedPath: String? = null
         private set
 
-    /** A generation is streaming right now — never unload under it. */
-    @Volatile
-    var generating = false
-        private set
-
+    /** Written and read under [lock]. */
     private var runner: ModelRunner? = null
-    private val mutex = Mutex()
 
-    data class Result(val text: String, val stats: GenerationStats?, val wallMs: Long)
+    /** An unload that a run stood in the way of: why it was wanted, until that run ends. */
+    private val releaseWanted = java.util.concurrent.atomic.AtomicReference<String?>(null)
 
+    /** [readingMs] runs up to the first token, and is all of [wallMs] when none came. */
+    data class Result(val text: String, val stats: GenerationStats?, val wallMs: Long, val readingMs: Long)
+
+    fun isLoaded(path: String): Boolean = loadedPath == path
+
+    /** [lock] must be held. */
     suspend fun ensureLoaded(path: String, ctx: Int, threads: Int) {
         if (loadedPath == path && runner != null) return
-        mutex.withLock {
-            if (loadedPath == path && runner != null) return@withLock
-            releaseLocked("model switch")
-            // Multi-second load + worker threads must never compete with
-            // typing — same background-priority rule as the llama lanes.
-            val r = try {
-                android.os.Process.setThreadPriority(
-                    android.os.Process.THREAD_PRIORITY_BACKGROUND
-                )
-                LeapClient.loadModel(
-                    path,
-                    ModelLoadingOptions(cpuThreads = threads, contextSize = ctx)
-                )
-            } finally {
-                android.os.Process.setThreadPriority(
-                    android.os.Process.THREAD_PRIORITY_DEFAULT
-                )
-            }
-            runner = r
-            loadedPath = path
-            AiDiagLog.lastLoadEvent =
-                "LFM loaded via LEAP (ctx $ctx, threads $threads, manifest sampling)"
+        releaseLocked("model switch")
+        // Multi-second load + worker threads must never compete with
+        // typing — same background-priority rule as the llama lanes.
+        val r = try {
+            android.os.Process.setThreadPriority(
+                android.os.Process.THREAD_PRIORITY_BACKGROUND
+            )
+            LeapClient.loadModel(
+                path,
+                ModelLoadingOptions(cpuThreads = threads, contextSize = ctx)
+            )
+        } finally {
+            android.os.Process.setThreadPriority(
+                android.os.Process.THREAD_PRIORITY_DEFAULT
+            )
         }
+        runner = r
+        loadedPath = path
+        AiDiagLog.lastLoadEvent =
+            "LFM loaded via LEAP (ctx $ctx, threads $threads, manifest sampling)"
     }
 
     /**
      * One FRESH conversation per draft — shared history between drafts is
      * exactly the cross-contamination 1.6.x spent three releases removing.
      * LEAP's own prefix cache still makes the repeated system prompt cheap.
+     * [lock] must be held.
      */
     suspend fun generate(
         system: String,
@@ -85,7 +92,6 @@ class LeapEngine(private val context: Context) {
         onToken: (String) -> Unit
     ): Result = withContext(Dispatchers.Default) {
         val r = runner ?: throw IllegalStateException("LEAP model not loaded")
-        generating = true
         // Decode at background priority, same rule as the load path: the
         // runner's worker threads must never compete with typing.
         android.os.Process.setThreadPriority(
@@ -97,12 +103,14 @@ class LeapEngine(private val context: Context) {
             val sb = StringBuilder()
             var stats: GenerationStats? = null
             var failure: Throwable? = null
+            var firstTokenAt = 0L
             conv.generateResponse(
                 ChatMessage(ChatMessage.Role.USER, user),
                 GenerationOptions(maxTokens = maxTokens)
             ).collect { resp ->
                 when (resp) {
                     is MessageResponse.Chunk -> {
+                        if (firstTokenAt == 0L) firstTokenAt = android.os.SystemClock.elapsedRealtime()
                         sb.append(resp.text)
                         onToken(resp.text)
                     }
@@ -114,24 +122,38 @@ class LeapEngine(private val context: Context) {
                 }
             }
             failure?.let { throw it }
-            Result(sb.toString(), stats, android.os.SystemClock.elapsedRealtime() - t0)
+            val now = android.os.SystemClock.elapsedRealtime()
+            Result(sb.toString(), stats, now - t0, (if (firstTokenAt == 0L) now else firstTokenAt) - t0)
         } finally {
             android.os.Process.setThreadPriority(
                 android.os.Process.THREAD_PRIORITY_DEFAULT
             )
-            generating = false
         }
     }
 
     suspend fun release(reason: String) {
         if (loadedPath == null) return
-        if (generating) {
-            // Same rule as the native lanes: freeing under a running decode
-            // is a use-after-free — skip; the next idle sweep gets it.
+        if (!lock.tryLock()) {
+            // Same rule as the native lanes: never unload under a run. This one
+            // goes when that run ends, see [releaseIfWanted].
+            releaseWanted.set(reason)
             AiDiagLog.lastLoadEvent = "leap unload skipped ($reason) — gen in flight"
             return
         }
-        mutex.withLock { releaseLocked(reason) }
+        try {
+            releaseLocked(reason)
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    /** Someone came back for the model, so an unload put off until now is not wanted any more. */
+    fun forgetRelease() = releaseWanted.set(null)
+
+    /** A run has ended. Does the unload it stood in the way of, if nobody came back since. */
+    suspend fun releaseIfWanted() {
+        val reason = releaseWanted.getAndSet(null) ?: return
+        release(reason)
     }
 
     private suspend fun releaseLocked(reason: String) {
@@ -143,6 +165,8 @@ class LeapEngine(private val context: Context) {
     }
 
     companion object {
+        val shared = LeapEngine()
+
         /** LFM-family models route to LEAP. Matched on the file name so
          *  catalog entries AND user imports land here automatically. */
         fun handles(spec: ModelSpec): Boolean =

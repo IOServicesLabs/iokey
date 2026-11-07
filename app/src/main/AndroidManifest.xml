@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  PRIVACY NOTICE: Typing data NEVER leaves this device. The app declares
-  INTERNET solely so the user can explicitly download the optional Qwen3-0.6B
-  neural model from Hugging Face (Settings -> Language model). No analytics,
-  no ads, no telemetry — network is used only for that user-initiated download.
+  PRIVACY NOTICE: IOKey does not send typing data anywhere. The app declares
+  INTERNET so the user can download the models they choose, voice models and
+  links they add included, and the network switch in the privacy settings
+  turns that off. IOKey has no analytics or ads of its own. The Play build also
+  carries Google Play's billing library, which talks to Google Play and sends
+  its own diagnostics to Google; that switch does not reach it.
   Distribution-specific permissions (READ_SMS, and the accessibility
   service used for on-screen AI context) live in src/full/AndroidManifest.xml
   and are absent from the Play build entirely.
@@ -11,7 +13,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Used ONLY for the user-initiated one-time model download -->
+    <!-- For downloading the models the user chooses. See the notice above about Play billing. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- Per-key vibration feedback (Vibrator service). A normal permission,
          granted at install — no runtime prompt. Missing it made KeyFeedback's
@@ -149,11 +151,11 @@
             android:label="@string/test_lab_title"
             android:theme="@style/Theme.LocalBoard" />
 
-        <!-- Finger-fit calibration game -->
+        <!-- Where the finger-fit tests used to be. Says that keys no longer move. -->
         <activity
             android:name=".settings.CalibrateActivity"
             android:exported="false"
-            android:label="Fit keyboard to your fingers"
+            android:label="@string/keys_stay_title"
             android:theme="@style/Theme.LocalBoard" />
 
         <!-- Transparent trampoline so the keyboard can request the mic
@@ -162,6 +164,20 @@
             android:name=".settings.VoicePermissionActivity"
             android:exported="false"
             android:label=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- The quick prompt's box. An activity, because a window owned by the keyboard's own
+             window cannot be typed into. See-through, and gone as soon as it is left. A rotation,
+             or a change of dark mode, text size or language, stays in the same instance: the
+             request it answers does not survive a rebuild, and neither does what was typed. -->
+        <activity
+            android:name=".ime.QuickPromptActivity"
+            android:exported="false"
+            android:label=""
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|locale|layoutDirection"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
     </application>
